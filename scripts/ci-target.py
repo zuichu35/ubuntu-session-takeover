@@ -121,7 +121,8 @@ def main():
         directory.mkdir(exist_ok=True)
         run(name, ['/usr/bin/python3', *arguments], timeout=240, extra={
             'NATIVE_TEST_RUNTIME_ROOT': str(ROOT), 'NATIVE_TEST_ARTIFACT_ROOT': str(directory),
-            'NATIVE_TEST_RUN_DIR': str(directory / 'runtime'), 'NATIVE_TEST_FREERDP': freerdp})
+            'NATIVE_TEST_RUN_DIR': str(directory / 'runtime'), 'NATIVE_TEST_FREERDP': freerdp,
+            'NATIVE_TEST_NO_CLIPBOARD': '1'})
         evidence[name] = {str(path.relative_to(ROOT)): digest(path)
                           for path in directory.rglob('*result.json')}
         if not evidence[name]:
@@ -164,6 +165,7 @@ def main():
         'limitations': ['Headless virtual outputs and CPU rendering',
             'Private fake logind/GDM; real GNOME Shell ScreenShield',
             'Test authentication helper; real PAM and GDM cold boot unverified',
+            'Clipboard channel disabled in CI; clipboard and file transfer unverified',
             'No physical GPU/display/input or Windows/macOS client acceptance']}
     facts = collect_snapshot(ROOT, profile, required_owner=os.getuid(),
                              profile_sha256=manifest['profile_sha256'])

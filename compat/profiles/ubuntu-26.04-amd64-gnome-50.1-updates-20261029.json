@@ -184,7 +184,8 @@
     "No Windows/macOS client, hardware hotplug/suspend or NVIDIA validation is implied.",
     "Only this exact package tuple is eligible; no arbitrary GNOME 50.x or cross-ABI support.",
     "This profile alone does not contain a passing test receipt.",
-    "New distribution target candidate: source baseline remains upstream 50.1 plus the explicitly listed 2.4 backports, not the full Ubuntu 2.5 source patchset."
+    "New distribution target candidate: source baseline remains upstream 50.1 plus the explicitly listed 2.4 backports, not the full Ubuntu 2.5 source patchset.",
+    "Clipboard/file redirection is disabled in unprivileged target CI and is not covered by its validation receipt."
   ],
   "runtime_code": [
     "takeover/__init__.py",

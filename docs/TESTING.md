@@ -73,6 +73,13 @@ verify failure handling. They do not reproduce real GDM PAM or establish that
 a physical cold boot succeeds. A real FreeRDP connection in this environment
 also does not establish Windows/macOS client acceptance.
 
+The target CI container deliberately has no `/dev/fuse`, no Linux capabilities,
+and `NoNewPrivs` enabled. Its FreeRDP clients use `-clipboard` to avoid mounting
+the file-clipboard FUSE filesystem. This is a CI client setting only; it does
+not change the product's clipboard behavior. Clipboard and file transfer are
+explicitly unverified in the validation receipt. Desktop input, authentication,
+local reclaim, reconnection and handover assertions remain required.
+
 ## Target-version CI
 
 `.github/workflows/target.yml` runs on pushes, pull requests and explicit manual

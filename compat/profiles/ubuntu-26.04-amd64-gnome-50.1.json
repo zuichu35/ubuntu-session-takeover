@@ -183,7 +183,8 @@
     "Target private-bus/headless CPU integration is distinct from physical DRM/libinput and real GDM/PAM acceptance.",
     "No Windows/macOS client, hardware hotplug/suspend or NVIDIA validation is implied.",
     "Only this exact package tuple is eligible; no arbitrary GNOME 50.x or cross-ABI support.",
-    "This profile alone does not contain a passing test receipt."
+    "This profile alone does not contain a passing test receipt.",
+    "Clipboard/file redirection is disabled in unprivileged target CI and is not covered by its validation receipt."
   ],
   "runtime_code": [
     "takeover/__init__.py",

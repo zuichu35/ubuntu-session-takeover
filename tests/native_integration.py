@@ -350,6 +350,7 @@ def main():
         return spawn([os.environ.get('NATIVE_TEST_FREERDP', str(ROOT / 'vendor/ubuntu-freerdp/root/usr/bin/xfreerdp')), '/v:127.0.0.1:43392',
                       '/u:native-test', '/p:' + pwd, '/cert:ignore', '/size:1280x720', '/gfx:RFX',
                       '/network:lan', '/title:' + title] +
+                     (['-clipboard'] if os.environ.get('NATIVE_TEST_NO_CLIPBOARD') == '1' else []) +
                      (['/dynamic-resolution'] if '--adaptive' in sys.argv else []), client_env, title)
 
     bad = remote('NativeBadPassword', 'invalid-' + secrets.token_urlsafe(8))
