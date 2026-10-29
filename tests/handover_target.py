@@ -19,6 +19,7 @@ def launch(env, prefix, run, password, cert, key):
                          stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
     harness.children.append(bus)
     env['DBUS_SESSION_BUS_ADDRESS']=bus.stdout.readline().strip()
+    env['DBUS_SYSTEM_BUS_ADDRESS']=env['DBUS_SESSION_BUS_ADDRESS']
     harness.spawn(['pipewire'],env,'target-pipewire')
     harness.wait_for(lambda:(run/'pipewire-0').exists(),'Target PipeWire missing')
     cfg=run/'config/wireplumber/wireplumber.conf.d';cfg.mkdir(parents=True,exist_ok=True)

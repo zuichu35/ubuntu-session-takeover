@@ -1,0 +1,40 @@
+name: Target GNOME integration
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: target-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  target:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build Ubuntu 26.04 dependency image
+        run: |
+          docker build --build-arg CI_UID="$(id -u)" --build-arg CI_GID="$(id -g)" \
+            -f ci/target.Dockerfile -t native-target-ci .
+      - name: Build pinned runtime and run all target cases
+        run: |
+          docker run --rm --cap-drop=ALL --security-opt=no-new-privileges \
+            --shm-size=1g --pids-limit=512 \
+            -e NATIVE_TEST_HOST_NET_NS="$(readlink /proc/self/ns/net)" \
+            -v "$PWD:/workspace" native-target-ci
+      - name: Report validation result
+        if: always()
+        run: |
+          if test -f build/compatibility-validation.json; then
+            cat build/compatibility-validation.json >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'Target build or integration failed; no passing validation receipt was produced.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi

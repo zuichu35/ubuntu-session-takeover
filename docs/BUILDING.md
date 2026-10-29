@@ -5,8 +5,9 @@
 `tests/live*.py`。推荐使用同版本的独立构建机/虚拟机；本页的 apt 命令会改变该构建机
 的软件包，构建步骤本身只写项目的 `vendor/`、`build/` 和 `dist/`。
 
-发布整理时验证了固定 Git 对象获取、补丁应用和轻量单元测试；**没有从全新操作系统
-重新完成整个 Mutter/GRD 编译、实体 GDM/PAM 登录或 Windows/macOS 客户端验收**。
+源码测试与目标集成 CI 分开：后者在隔离 Ubuntu 26.04 容器中从固定上游源码构建并测试
+Mutter/GRD 和真实系统 Shell，结果以对应提交的 Actions 为准。**实体 GDM/PAM 登录和
+Windows/macOS 客户端验收仍独立于 CI**。
 源码 commit 固定不意味着 apt 依赖、编译器和输出二进制位级可复现。
 
 ## 1. 基础工具与依赖
@@ -90,7 +91,8 @@ GRD 的 sysusers/tmpfiles 目标也固定到私有前缀；Meson 的全部安装
 ABI 记录脚本只读取七个固定的公开系统文件，默认写项目内
 `build/native-system-abi.json`；不会查询凭据、改变配置或启动服务。它是诊断快照，
 **不是 ABI 兼容性或测试通过的证明**。系统更新后需要重新评估、构建和验证，不能只刷新
-hash 就认定兼容。当前 launcher 对系统 hash 差异采取提示策略，也不代表所有未来版本安全。
+hash 就认定兼容。launcher 另外要求兼容配置、最终产物清单和实际目标测试收据匹配；
+缺少验证时不会尝试加载私有 Mutter。见 [兼容机制](COMPATIBILITY.md)。
 
 开发 prefix 编译后包含当前构建目录的绝对资源路径，不能直接搬到 `/opt`，也不能让
 无权访问该 HOME 的 GDM 用户使用。用于 GDM 的 GRD 必须按最终 `/opt` 前缀重新编译，

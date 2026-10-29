@@ -312,11 +312,29 @@ NotifyAccess=main
                     os.chown(path, self.owner_uid, self.owner_gid, follow_symlinks=False)
                     if not path.is_symlink():
                         path.chmod(0o755 if path.is_dir() or path.stat().st_mode & 0o111 else 0o644)
+            self.verify_candidate_compatibility(temporary)
             os.rename(temporary, destination)
             self.verify_prefix(manifest)
         finally:
             if temporary.exists():
                 shutil.rmtree(temporary)
+
+    def verify_candidate_compatibility(self, staged):
+        """Gate new-policy bundles before changing the installed runtime or units.
+
+        Historical bundles without a compatibility policy retain their original
+        checks. New launchers always ship this module and need final-payload
+        evidence; a developer-owner inspection is never deployment approval.
+        """
+        source = staged / 'takeover/compatibility.py'
+        if not source.exists():
+            return
+        namespace = {'__file__': str(source), '__name__': 'staged_compatibility'}
+        exec(compile(source.read_text(), str(source), 'exec'), namespace)
+        report = namespace['inspect_candidate'](staged, required_owner=0,
+            system_root=self.root, runtime_prefix=PREFIX)
+        if report.get('status') != 'verified' or report.get('production_eligible') is not True:
+            raise RuntimeError('Final candidate compatibility is not verified: ' + json.dumps(report))
 
     def prepare_files(self, temporary):
         # The module is part of the checksum-verified payload and only supplies

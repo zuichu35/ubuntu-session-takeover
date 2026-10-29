@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 OLD = ROOT / 'dist/3392-login-fix-20261028'
@@ -33,10 +34,11 @@ def build(destination):
     # compiled resource path; namespace tests bind this candidate there.
     shutil.rmtree(payload / 'build/native-prefix')  # Only this fresh bundle copy.
     shutil.copytree(NATIVE, payload / 'build/native-prefix', symlinks=True)
-    for relative in ('scripts/native-session.py', 'scripts/finish-login-guard.py',
+    for relative in ('scripts/native-shell.py', 'scripts/native-session.py', 'scripts/finish-login-guard.py',
                      'takeover/startup_guard.py', 'takeover/login_gateway.py',
                      'takeover/native_broker.py'):
         shutil.copy2(ROOT / relative, payload / relative)
+    subprocess.run(['/usr/bin/python3', str(ROOT / 'scripts/package-compatibility.py'), str(payload)], check=True)
     supervisor = payload / 'scripts/native-session.py'
     text = supervisor.read_text()
     development = 'vendor/grd-deps/root/usr/lib/x86_64-linux-gnu'
@@ -80,7 +82,8 @@ def build(destination):
         'native_build': str(NATIVE), 'native_sha256': digest(payload / 'build/native-prefix/lib/x86_64-linux-gnu/libmutter-18.so.0'),
         'grd_sha256': digest(payload / 'build/grd-prefix/libexec/gnome-remote-desktop-daemon'),
         'previous_bundle_sha256': digest(destination / 'before-handover-manifest.json'),
-        'services_changed': False, 'real_cold_boot_accepted': False}, indent=2) + '\n')
+        'services_changed': False, 'real_cold_boot_accepted': False,
+        'compatibility_validation': 'pending: validate the final payload before activation'}, indent=2) + '\n')
     print(destination)
 
 

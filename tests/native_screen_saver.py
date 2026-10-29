@@ -86,12 +86,76 @@ else:
     GLib.timeout_add(250, follow_real_saver)
 
 session = Gio.DBusNodeInfo.new_for_xml('''<node><interface name="org.freedesktop.login1.Session">
-<property name="LockedHint" type="b" access="read"/></interface></node>''')
+<method name="SetLockedHint"><arg type="b" direction="in"/></method>
+<method name="Activate"/>
+<property name="LockedHint" type="b" access="read"/>
+<property name="Id" type="s" access="read"/>
+<property name="Active" type="b" access="read"/>
+<property name="Class" type="s" access="read"/>
+<property name="Type" type="s" access="read"/>
+<property name="State" type="s" access="read"/>
+<property name="Remote" type="b" access="read"/>
+<property name="User" type="(uo)" access="read"/>
+<property name="Seat" type="(so)" access="read"/>
+<signal name="Lock"/><signal name="Unlock"/>
+</interface></node>''')
 def property_value(*args):
-    if config().get('fail_hint_read'):
+    name = args[-1]
+    if name == 'LockedHint' and config().get('fail_hint_read'):
         return None
-    return GLib.Variant('b', locked_hint)
+    return {'LockedHint': GLib.Variant('b', locked_hint), 'Id': GLib.Variant('s', 'test'),
+            'Active': GLib.Variant('b', True), 'Class': GLib.Variant('s', 'user'),
+            'Type': GLib.Variant('s', 'wayland'), 'State': GLib.Variant('s', 'active'),
+            'Remote': GLib.Variant('b', False),
+            'User': GLib.Variant('(uo)', (os.getuid(), '/org/freedesktop/login1/user/test')),
+            'Seat': GLib.Variant('(so)', ('seat0', '/org/freedesktop/login1/seat/seat0'))}[name]
+
+
+def session_method(conn, sender, obj, interface, method, params, invocation):
+    if method == 'SetLockedHint' and not config().get('fail_hint'):
+        set_hint(params.unpack()[0])
+    invocation.return_value(None)
+
+
 for object_path in ('/test', '/org/freedesktop/login1/session/test'):
-    conn.register_object(object_path, session.interfaces[0], None, property_value, None)
+    conn.register_object(object_path, session.interfaces[0], session_method, property_value, None)
 Gio.bus_own_name_on_connection(conn, 'org.freedesktop.login1', Gio.BusNameOwnerFlags.DO_NOT_QUEUE, None, None)
+
+# Minimal system services for a real GNOME Shell in a container. Every call
+# stays on the private test bus; no real login session is created or changed.
+manager = Gio.DBusNodeInfo.new_for_xml('''<node><interface name="org.freedesktop.login1.Manager">
+<method name="GetSession"><arg type="s" direction="in"/><arg type="o" direction="out"/></method>
+<method name="GetUser"><arg type="u" direction="in"/><arg type="o" direction="out"/></method>
+<method name="ListSessions"><arg type="a(susso)" direction="out"/></method>
+<method name="Inhibit"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="h" direction="out"/></method>
+<property name="PreparingForSleep" type="b" access="read"/>
+</interface></node>''')
+
+
+def manager_method(conn, sender, obj, interface, method, params, invocation):
+    if method == 'GetSession':
+        invocation.return_value(GLib.Variant('(o)', ('/org/freedesktop/login1/session/test',)))
+    elif method == 'GetUser':
+        invocation.return_value(GLib.Variant('(o)', ('/org/freedesktop/login1/user/test',)))
+    elif method == 'ListSessions':
+        invocation.return_value(GLib.Variant('(a(susso))', ([('test', os.getuid(), 'fixture', 'seat0', '/org/freedesktop/login1/session/test')],)))
+    elif method == 'Inhibit':
+        fd = os.open('/dev/null', os.O_RDONLY)
+        try:
+            descriptors = Gio.UnixFDList.new()
+            index = descriptors.append(fd)
+            invocation.return_value_with_unix_fd_list(GLib.Variant('(h)', (index,)), descriptors)
+        finally:
+            os.close(fd)
+
+
+conn.register_object('/org/freedesktop/login1', manager.interfaces[0], manager_method,
+                     lambda *args: GLib.Variant('b', False), None)
+gdm = Gio.DBusNodeInfo.new_for_xml('''<node><interface name="org.gnome.DisplayManager.Manager">
+<method name="RegisterSession"/><method name="RegisterDisplay"/>
+<property name="Version" type="s" access="read"/></interface></node>''')
+conn.register_object('/org/gnome/DisplayManager/Manager', gdm.interfaces[0],
+                     lambda c, s, o, i, m, p, call: call.return_value(None),
+                     lambda *args: GLib.Variant('s', '50.1'), None)
+Gio.bus_own_name_on_connection(conn, 'org.gnome.DisplayManager', Gio.BusNameOwnerFlags.DO_NOT_QUEUE, None, None)
 GLib.MainLoop().run()

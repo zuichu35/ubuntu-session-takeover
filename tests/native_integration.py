@@ -93,6 +93,10 @@ def main():
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     harness.children.append(bus)
     env['DBUS_SESSION_BUS_ADDRESS'] = bus.stdout.readline().strip()
+    # A test compositor must never send Lock/Unlock or GDM registration to
+    # the host system bus. The fake logind below lives on this private bus.
+    env['DBUS_SYSTEM_BUS_ADDRESS'] = env['DBUS_SESSION_BUS_ADDRESS']
+    env['XDG_SESSION_ID'] = 'test'
     spawn(['pipewire'], env, 'pipewire')
     wait_for(lambda: (RUN / 'pipewire-0').exists(), 'private PipeWire did not start')
     cfg = RUN / 'config/wireplumber/wireplumber.conf.d'
@@ -120,10 +124,6 @@ def main():
         native_env['MUTTER_NATIVE_GREETER'] = '1'
     native_env['MUTTER_NATIVE_TEST_AUTH_HELPER'] = str(fake_auth)
     native_env['MUTTER_NATIVE_TEST_FRAME'] = str(ART / 'physical-local-lock.png')
-    if SHELL:
-        # Never let a test Shell's lock operations target the physical session.
-        sessions = json.loads(subprocess.check_output(['loginctl', 'list-sessions', '--json=short']))
-        native_env['XDG_SESSION_ID'] = next(str(s['session']) for s in sessions if s['uid'] == os.getuid() and s['class'] == 'manager')
     command = ['/usr/bin/gnome-shell'] if SHELL else [str(prefix / 'bin/mutter')]
     if SHELL and '--nx' in sys.argv:
         command = ['/usr/NX/scripts/env/nxpreload.sh', '/usr/bin/gnome-shell', '--mode=ubuntu']
@@ -191,6 +191,14 @@ def main():
             raise AssertionError('Unprotected local viewport request was accepted')
     if SHELL:
         wait_for(lambda: 'GNOME Shell started' in (ART / 'mutter.log').read_text(), 'real GNOME Shell did not finish startup')
+    loaded_files = {}
+    for line in Path(f'/proc/{compositor.pid}/maps').read_text().splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) == 6 and fields[5].startswith('/'):
+            mapped = Path(fields[5])
+            if mapped.is_file() and (str(mapped).startswith(str(lib)) or
+                                    mapped.name in ('gnome-shell', 'libshell-18.so')):
+                loaded_files[str(mapped.resolve())] = hashlib.sha256(mapped.read_bytes()).hexdigest()
     if '--ime' in sys.argv:
         result = observer.call_sync('org.gnome.Shell', '/org/gnome/Shell',
             'org.gnome.Shell.Extensions', 'EnableExtension', GLib.Variant('(s)', ('kimpanel@kde.org',)),
@@ -322,7 +330,7 @@ def main():
         threading.Thread(target=accept,daemon=True).start()
 
     def remote(title, pwd=password):
-        return spawn([str(ROOT / 'vendor/ubuntu-freerdp/root/usr/bin/xfreerdp'), '/v:127.0.0.1:43392',
+        return spawn([os.environ.get('NATIVE_TEST_FREERDP', str(ROOT / 'vendor/ubuntu-freerdp/root/usr/bin/xfreerdp')), '/v:127.0.0.1:43392',
                       '/u:native-test', '/p:' + pwd, '/cert:ignore', '/size:1280x720', '/gfx:RFX',
                       '/network:lan', '/title:' + title] +
                      (['/dynamic-resolution'] if '--adaptive' in sys.argv else []), client_env, title)
@@ -664,7 +672,7 @@ def main():
               'failed_lock_stays_black': not SHELL, 'reconnect_preserves_original_app': True,
               'owner_loss_during_async_unlock_safe': not SHELL,
               'output_backend': 'headless virtual output using patched native Mutter code',
-              'lock_backend': 'GNOME Shell 50.1 ScreenShield' if SHELL else 'fault-injected test ScreenSaver',
+              'lock_backend': (subprocess.check_output(['/usr/bin/gnome-shell', '--version'], text=True).strip() + ' ScreenShield') if SHELL else 'fault-injected test ScreenSaver',
               'logind_locked_hint_checked': False,
               'physical_drm_libinput_tested': False, 'physical_pam_tested': False, 'windows_mstsc_tested': False}
     result['system_nx_wrapper_tested'] = '--nx' in sys.argv
@@ -678,6 +686,7 @@ def main():
     result['input_method_panel_verified'] = '--ime' in sys.argv
     result['tested_binaries'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in
         [lib / 'libmutter-18.so.0', RUNTIME_ROOT / 'build/grd-prefix/libexec/gnome-remote-desktop-daemon']}
+    result['loaded_files'] = loaded_files
     target = 'native-shell-integration-result.json' if SHELL else 'native-integration-result.json'
     if RUNTIME_ROOT != ROOT:
         target = 'package-' + target

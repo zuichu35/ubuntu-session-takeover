@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 PREFIX = Path('/opt/ubuntu-native-takeover-login-20261028')
@@ -67,6 +68,7 @@ def main():
                  'greeter_identity.py', 'greeter_config.py', 'startup_guard.py'):
         shutil.copy2(ROOT / 'takeover' / name, payload / 'takeover' / name)
     shutil.copy2(ROOT / 'COPYING', payload / 'COPYING')
+    subprocess.run(['/usr/bin/python3', str(ROOT / 'scripts/package-compatibility.py'), str(payload)], check=True)
     recorded = json.loads((ROOT / 'build/native-system-abi.json').read_text())
     abi = {path: digest(Path(path)) for path in recorded}
     if abi != recorded:
@@ -93,6 +95,7 @@ def main():
         'grd_sha256': digest(payload / 'build/grd-prefix/libexec/gnome-remote-desktop-daemon'),
         'source_root': str(ROOT), 'target_prefix': str(PREFIX),
         'live_services_changed': False,
+        'compatibility_validation': 'pending: validate the final payload before activation',
     }, indent=2) + '\n')
     print(DIST)
 

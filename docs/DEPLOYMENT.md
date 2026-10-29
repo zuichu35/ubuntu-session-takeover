@@ -9,7 +9,7 @@
 | 工具 | 使用范围 |
 |---|---|
 | `check-native-health.py` | 默认只读；`--tls` 仅在空闲时进行协议探测，不能证明桌面登录成功 |
-| `native-shell.py --check` | 诊断当前构建与系统 ABI 指纹，不修改桌面 |
+| `check-compatibility.py`、`native-shell.py --check` | 只读检查精确兼容配置、ABI、文件归属、最终产物和目标测试收据 |
 | `install-native.py` | 依赖匹配的本机集成测试和既有凭据；用于开发部署，不是完整初始安装器 |
 | `package-native.py`、`packaging/control.py` | 实验打包/交互设置工具；必须先审核依赖、测试证据与目标布局 |
 | `install-greeter-fix.py`、`install-greeter-startup-fix.py`、`install-handover-fix.py` | 有精确旧清单和原始备份的既有安装升级，缺失前置状态应拒绝执行 |
@@ -26,7 +26,10 @@
 
 原生后端默认不停止旧共享桌面的服务。只有明确选择 `--retire-legacy-services` 时才执行相关迁移动作。
 
-ABI 指纹变化当前用于诊断，启动器仍尝试加载私有 Mutter；实际动态库加载错误会报错。这不是对任意 GNOME 更新兼容性的保证。
+系统 ABI 指纹变化用于诊断，私有启动还必须通过精确兼容配置和目标测试收据检查。
+未验证组合只有在确认无隐私 guard、无现存 compositor 时才回退系统 Shell，原生后端
+在该会话中退出；有 guard 或状态不明时拒绝启动。打包后的最终产物需重新验证，
+installer 会阻止激活缺少有效收据的新启动器。详见 [兼容机制](COMPATIBILITY.md)。
 
 ## 实机验收
 

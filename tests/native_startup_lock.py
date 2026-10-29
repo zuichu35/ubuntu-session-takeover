@@ -45,6 +45,7 @@ class Desktop:
                                env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.children.append(bus)
         env['DBUS_SESSION_BUS_ADDRESS'] = bus.stdout.readline().strip()
+        env['DBUS_SYSTEM_BUS_ADDRESS'] = env['DBUS_SESSION_BUS_ADDRESS']
         self.bus = Gio.DBusConnection.new_for_address_sync(env['DBUS_SESSION_BUS_ADDRESS'],
             Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
             None, None)

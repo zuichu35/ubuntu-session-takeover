@@ -98,6 +98,7 @@ def main():
     for name in ('COPYING',):
         copy(ROOT / name, app / name)
     copy(ROOT / 'packaging/README.zh-CN.md', app / 'README.md')
+    run(['/usr/bin/python3', ROOT / 'scripts/package-compatibility.py', app])
     # Public system-file fingerprints only. No home config or credentials enter the package.
     abi = json.loads((ROOT / 'build/native-system-abi.json').read_text())
     if not abi or any(hashlib.sha256(Path(p).read_bytes()).hexdigest() != h for p, h in abi.items()):
@@ -170,7 +171,7 @@ Description: Experimental RDP takeover of the existing native GNOME session
                     dest.symlink_to(p.readlink())
                 else:
                     copy(p, dest)
-    for directory in ('scripts', 'takeover', 'patches', 'packaging', 'tests'):
+    for directory in ('scripts', 'takeover', 'compat', 'ci', 'patches', 'packaging', 'tests'):
         for p in (ROOT / directory).rglob('*'):
             if p.is_file() and '__pycache__' not in p.parts:
                 copy(p, source_dir / p.relative_to(ROOT))

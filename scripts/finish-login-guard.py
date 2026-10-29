@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from takeover.login_gateway import boot_guard_present
 from takeover.greeter_identity import find_native_greeter_session
 from takeover.startup_guard import STARTUP_STATES, READY_STATES, wait_startup_ready
+from takeover.startup_policy import confirmed_system_fallback
 from gi.repository import Gio, GLib
 
 
@@ -20,6 +21,9 @@ def main():
     # A real greeter has no user desktop to lock. A group match, username or
     # inherited environment flag alone must never bypass the startup guard.
     if find_native_greeter_session() is not None:
+        return
+    if confirmed_system_fallback():
+        print(json.dumps({'event': 'native-startup-helper-skipped', 'reason': 'verified-system-shell-fallback'}), flush=True)
         return
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     name = 'org.gnome.Mutter.NativeTakeover'
@@ -31,9 +35,10 @@ def main():
     try:
         state = call('GetState')[0]
     except GLib.Error:
-        if boot_guard_present():
-            raise SystemExit('Missing startup privacy interface during remote login')
-        return
+        if confirmed_system_fallback(bus):
+            return
+        raise SystemExit('Missing startup privacy interface without a verified system-Shell fallback; '
+                         'privacy state is not changed. Inspect the journal from TTY or SSH.')
     if state in STARTUP_STATES:
         sessions = json.loads(subprocess.check_output(['loginctl', 'list-sessions', '--json=short']))
         candidates = [s for s in sessions if s['uid'] == os.getuid() and

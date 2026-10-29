@@ -12,6 +12,8 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+from takeover.compatibility import inspect_candidate
 LOGIN_CONFIG = Path('/etc/ubuntu-native-login/config.json')
 CONFIG = Path.home() / '.config/ubuntu-native-takeover'
 DATA = Path.home() / '.local/share/ubuntu-native-takeover'
@@ -23,22 +25,13 @@ def sha(path):
 
 
 def check():
-    abi = json.loads((ROOT / 'build/native-system-abi.json').read_text())
-    mismatches = [p for p, expected in abi.items() if not Path(p).exists() or sha(Path(p)) != expected]
+    candidate = inspect_candidate(ROOT, required_owner=0)
     files = json.loads((ROOT / 'package-files.json').read_text())
     damaged = [p for p, expected in files.items() if not (ROOT / p).exists() or sha(ROOT / p) != expected]
-    libraries = ROOT / 'build/native-prefix/lib/x86_64-linux-gnu'
-    env = dict(os.environ, LD_LIBRARY_PATH=f'{libraries}:{libraries}/mutter-18:' + os.environ.get('LD_LIBRARY_PATH', ''))
-    missing = []
-    for binary in (libraries / 'libmutter-18.so.0', ROOT / 'build/grd-prefix/libexec/gnome-remote-desktop-daemon'):
-        result = subprocess.run(['ldd', str(binary)], env=env, capture_output=True, text=True)
-        missing += [l.strip() for l in result.stdout.splitlines() if 'not found' in l]
-        if result.returncode:
-            missing.append('ldd failed: ' + str(binary))
-    return {'compatible': not damaged and not missing,
-            'startup_policy': 'attempt-load', 'hash_mismatch_blocks_startup': False,
-            'system_mismatches': mismatches, 'damaged_package_files': damaged,
-            'missing_libraries': sorted(set(missing)), 'port': 3392,
+    return {'compatible': not damaged and candidate.get('status') == 'verified'
+                          and candidate.get('production_eligible') is True,
+            'startup_policy': 'verified-private-or-guarded-fallback',
+            'candidate': candidate, 'damaged_package_files': damaged, 'port': 3392,
             'physical_hardware_acceptance': 'pending', 'windows_mstsc_acceptance': 'pending'}
 
 
@@ -76,7 +69,7 @@ def setup(args):
         raise RuntimeError('请以桌面用户运行 setup，不要使用 sudo。')
     report = check()
     if not report['compatible']:
-        raise RuntimeError('程序文件损坏或运行依赖缺失：' + json.dumps(report, ensure_ascii=False))
+        raise RuntimeError('安装包未通过当前系统的兼容性验证：' + json.dumps(report, ensure_ascii=False))
     files = launch_files()
     conflicts = [str(p) for p in files if p.exists()]
     if (CONFIG / 'install.json').exists():

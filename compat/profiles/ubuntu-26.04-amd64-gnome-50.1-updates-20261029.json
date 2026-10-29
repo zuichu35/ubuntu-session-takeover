@@ -1,0 +1,189 @@
+{
+  "schema": 1,
+  "id": "ubuntu-26.04-amd64-gnome-50.1-updates-20261029",
+  "maturity": "candidate-requires-target-receipt",
+  "target": {
+    "os_id": "ubuntu",
+    "os_version": "26.04",
+    "architecture": "x86_64",
+    "mutter_abi": "18",
+    "packages": {
+      "gnome-shell": "50.1-0ubuntu1.4",
+      "libmutter-18-0": "50.1-0ubuntu2.5",
+      "gir1.2-mutter-18": "50.1-0ubuntu2.5",
+      "gnome-remote-desktop": "50.2-0ubuntu0.1",
+      "libfreerdp3-3": "3.32.1+dfsg-0ubuntu0.26.04.1",
+      "libfreerdp-server3-3": "3.32.1+dfsg-0ubuntu0.26.04.1",
+      "libwinpr3-3": "3.32.1+dfsg-0ubuntu0.26.04.1"
+    }
+  },
+  "elf_machine": 62,
+  "shell_binary": "/usr/bin/gnome-shell",
+  "shell_needed": [
+    "libshell-18.so",
+    "libmutter-18.so.0",
+    "libmutter-clutter-18.so.0"
+  ],
+  "system_files": [
+    "/usr/bin/gnome-shell",
+    "/usr/lib/gnome-shell/libshell-18.so",
+    "/usr/lib/x86_64-linux-gnu/libmutter-18.so.0",
+    "/usr/lib/x86_64-linux-gnu/mutter-18/Meta-18.typelib",
+    "/usr/lib/x86_64-linux-gnu/mutter-18/Clutter-18.typelib",
+    "/usr/lib/x86_64-linux-gnu/mutter-18/Cogl-18.typelib",
+    "/usr/lib/x86_64-linux-gnu/mutter-18/Mtk-18.typelib"
+  ],
+  "paths": {
+    "native_prefix": "build/native-prefix",
+    "grd_prefix": "build/grd-prefix",
+    "library_subdir": "lib/x86_64-linux-gnu",
+    "mutter_subdir": "mutter-18"
+  },
+  "artifacts": [
+    {
+      "path": "build/native-prefix/lib/x86_64-linux-gnu/libmutter-18.so.0",
+      "kind": "elf",
+      "soname": "libmutter-18.so.0",
+      "exports": [
+        "meta_remote_access_controller_inhibit_remote_access"
+      ],
+      "markers": [
+        "org.gnome.Mutter.NativeTakeover",
+        "startup-locking",
+        "startup-failed",
+        "local-authenticated"
+      ]
+    },
+    {
+      "path": "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/libmutter-clutter-18.so.0",
+      "kind": "elf",
+      "soname": "libmutter-clutter-18.so.0",
+      "exports": [
+        "clutter_stage_view_invalidate_input_devices"
+      ]
+    },
+    {
+      "path": "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/libmutter-cogl-18.so.0",
+      "kind": "elf",
+      "soname": "libmutter-cogl-18.so.0"
+    },
+    {
+      "path": "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/libmutter-mtk-18.so.0",
+      "kind": "elf",
+      "soname": "libmutter-mtk-18.so.0"
+    },
+    {
+      "path": "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/Meta-18.typelib",
+      "kind": "typelib",
+      "library": "libmutter-18.so.0"
+    },
+    {
+      "path": "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/Clutter-18.typelib",
+      "kind": "typelib",
+      "library": "libmutter-clutter-18.so.0"
+    },
+    {
+      "path": "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/Cogl-18.typelib",
+      "kind": "typelib",
+      "library": "libmutter-cogl-18.so.0"
+    },
+    {
+      "path": "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/Mtk-18.typelib",
+      "kind": "typelib",
+      "library": "libmutter-mtk-18.so.0"
+    },
+    {
+      "path": "build/native-prefix/libexec/native-local-auth",
+      "kind": "elf",
+      "executable": true
+    },
+    {
+      "path": "build/grd-prefix/libexec/gnome-remote-desktop-daemon",
+      "kind": "elf",
+      "executable": true,
+      "markers": [
+        "Authenticated client acquired exclusive lease"
+      ],
+      "runtime_paths": [
+        "build/grd-prefix/share/gnome-remote-desktop",
+        "build/grd-prefix/share/gnome-remote-desktop/shaders"
+      ]
+    },
+    {
+      "path": "build/grd-prefix/share/glib-2.0/schemas/gschemas.compiled",
+      "kind": "resource"
+    },
+    {
+      "path": "build/grd-prefix/share/gnome-remote-desktop/grd-cuda-avc-utils_30.ptx",
+      "kind": "resource"
+    },
+    {
+      "path": "build/grd-prefix/share/gnome-remote-desktop/grd-cuda-damage-utils_30.ptx",
+      "kind": "resource"
+    },
+    {
+      "path": "build/grd-prefix/share/gnome-remote-desktop/grd.conf",
+      "kind": "resource"
+    },
+    {
+      "path": "build/grd-prefix/share/gnome-remote-desktop/shaders/grd-avc-dual-view_opt.spv",
+      "kind": "resource"
+    },
+    {
+      "path": "build/native-prefix/share/glib-2.0/schemas/gschemas.compiled",
+      "kind": "resource"
+    }
+  ],
+  "sources": {
+    "mutter": "8e9bb806da4a6a4fc87aa4a481b228dba6735cbd",
+    "gnome-remote-desktop": "60423c896a54e3eacb65bd93167e91c1ce5e648c",
+    "gvdb": "b54bc5da25127ef416858a3ad92e57159ff565b3",
+    "patches": {
+      "patches/mutter-native-takeover.patch": "1f7a80421950de1c2e3f1ba68a068ea050901994f0ecf110351ff06694c1d7e1",
+      "patches/grd-takeover.patch": "72e8a8a5ec940488de925e609c59ce4a8b4d1ce71c24e72adec354b803346b00",
+      "patches/ubuntu-50.1-0ubuntu2.4/output-kms-Filter-fallback-modes-by-panel-supported-refre.patch": "1d6deae8dff38e54905405880b164ebc464ec80e92845c5f8bcc178dc99fe074",
+      "patches/ubuntu-50.1-0ubuntu2.4/backends-monitor-manager-Fix-auto-rotate-on-phones-without.patch": "e7738af6c34c804848b68ea14c68db7d19cba00dfbd0634bbba128ff9ea8bbe1",
+      "patches/ubuntu-50.1-0ubuntu2.4/tests-monitor-orientation-Add-auto-rotate-test-for-phones.patch": "f7f59678e180ae696deb1d3699494f70f1d395d1672ae0c6f444ddd9606dad96",
+      "patches/ubuntu-50.1-0ubuntu2.4/backends-native-Increase-fallback-mode-refresh-rate-toler.patch": "2d2cbf39af3367d6f8aade4ff32b6cf25442a652d2036e94e30b4428797261d1"
+    }
+  },
+  "distro_baseline": {
+    "mutter_package": "50.1-0ubuntu2.4",
+    "policy": "Upstream 50.1 plus the four listed Ubuntu backports; not the full Ubuntu patch series."
+  },
+  "required_cases": [
+    "target-shell-startup",
+    "desktop-rdp",
+    "startup-dual-lock",
+    "local-auth-reclaim",
+    "gateway-handover"
+  ],
+  "tested_runtime": [
+    "build/native-prefix/lib/x86_64-linux-gnu/libmutter-18.so.0",
+    "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/libmutter-clutter-18.so.0",
+    "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/libmutter-cogl-18.so.0",
+    "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/libmutter-mtk-18.so.0",
+    "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/Meta-18.typelib",
+    "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/Clutter-18.typelib",
+    "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/Cogl-18.typelib",
+    "build/native-prefix/lib/x86_64-linux-gnu/mutter-18/Mtk-18.typelib",
+    "build/native-prefix/libexec/native-local-auth",
+    "build/grd-prefix/libexec/gnome-remote-desktop-daemon"
+  ],
+  "tested_system": [
+    "/usr/bin/gnome-shell",
+    "/usr/lib/gnome-shell/libshell-18.so",
+    "/usr/lib/x86_64-linux-gnu/libmutter-18.so.0",
+    "/usr/lib/x86_64-linux-gnu/mutter-18/Meta-18.typelib",
+    "/usr/lib/x86_64-linux-gnu/mutter-18/Clutter-18.typelib",
+    "/usr/lib/x86_64-linux-gnu/mutter-18/Cogl-18.typelib",
+    "/usr/lib/x86_64-linux-gnu/mutter-18/Mtk-18.typelib"
+  ],
+  "limitations": [
+    "Target private-bus/headless CPU integration is distinct from physical DRM/libinput and real GDM/PAM acceptance.",
+    "No Windows/macOS client, hardware hotplug/suspend or NVIDIA validation is implied.",
+    "Only this exact package tuple is eligible; no arbitrary GNOME 50.x or cross-ABI support.",
+    "This profile alone does not contain a passing test receipt.",
+    "New distribution target candidate: source baseline remains upstream 50.1 plus the explicitly listed 2.4 backports, not the full Ubuntu 2.5 source patchset."
+  ]
+}

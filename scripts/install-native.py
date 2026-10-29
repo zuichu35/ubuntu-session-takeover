@@ -7,14 +7,20 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from takeover.compatibility import inspect_candidate
 CONFIG = Path.home() / '.config/ubuntu-native-takeover'
 DATA = Path.home() / '.local/share/ubuntu-native-takeover'
 USER = Path.home() / '.config/systemd/user'
 
 
 def main():
+    candidate = inspect_candidate(ROOT, required_owner=0)
+    if candidate.get('status') != 'verified' or candidate.get('production_eligible') is not True:
+        raise RuntimeError('Activation requires a root-managed, validated runtime: ' + json.dumps(candidate))
     os.umask(0o077)
     result = json.loads((ROOT / 'artifacts/native-integration-result.json').read_text())
     if not all(result.get(k) for k in ('rdp_input_to_original_app', 'black_stage_with_live_remote_scene',

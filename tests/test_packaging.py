@@ -63,7 +63,7 @@ class PackageActivation(unittest.TestCase):
         self.assertFalse(run.called)
         self.assertEqual(list(self.home.iterdir()), [])
 
-    def test_system_update_is_advisory_but_broken_package_still_fails(self):
+    def test_package_setup_requires_verified_candidate_and_intact_files(self):
         self.control.ROOT = self.home
         (self.home / 'build').mkdir()
         system = self.home / 'system-library'
@@ -73,11 +73,16 @@ class PackageActivation(unittest.TestCase):
         package.write_bytes(b'intact')
         (self.home / 'package-files.json').write_text(json.dumps({
             'payload': hashlib.sha256(package.read_bytes()).hexdigest()}))
-        with patch.object(self.control.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')):
+        candidate = {'status': 'verified', 'production_eligible': True}
+        with patch.object(self.control, 'inspect_candidate', return_value=candidate):
             report = self.control.check()
             self.assertTrue(report['compatible'])
-            self.assertEqual(report['system_mismatches'], [str(system)])
-            self.assertFalse(report['hash_mismatch_blocks_startup'])
+            candidate['status'] = 'needs-validation'
+            self.assertFalse(self.control.check()['compatible'])
+            candidate['status'] = 'verified'
+            candidate['production_eligible'] = False
+            self.assertFalse(self.control.check()['compatible'])
+            candidate['production_eligible'] = True
             package.write_bytes(b'broken')
             self.assertFalse(self.control.check()['compatible'])
 

@@ -39,14 +39,16 @@ flowchart LR
 
 ## 平台范围
 
-开发目标为 **Ubuntu 26.04 amd64、GNOME Shell/Mutter 50.x、Mutter ABI 18、GRD 50.2**。源码补丁基线固定为：
+开发目标为 **Ubuntu 26.04 amd64、GNOME Shell/Mutter 50.1、Mutter ABI 18、GRD 50.2**，仅接受兼容配置中列出的精确软件包组合。源码补丁基线固定为：
 
 | 组件 | 提交 |
 |---|---|
 | Mutter 50.1 | `8e9bb806da4a6a4fc87aa4a481b228dba6735cbd` |
 | GNOME Remote Desktop 50.2 | `60423c896a54e3eacb65bd93167e91c1ce5e648c` |
 
-Mutter 补丁包含列出的四个 Ubuntu `50.1-0ubuntu2.4` 增补补丁，不代表完整发行版 patch series。GNOME Shell、Mutter 库和系统 typelibs 必须匹配；Ubuntu 24.04 CI 只运行源代码测试，不证明其可以运行此 compositor。
+Mutter 补丁包含列出的四个 Ubuntu `50.1-0ubuntu2.4` 增补补丁，不代表完整发行版 patch series。GNOME Shell、Mutter 库和系统 typelibs 必须匹配；Ubuntu 24.04 源码测试之外，目标 CI 在隔离的 Ubuntu 26.04 容器内构建并运行真实 Shell/Mutter/GRD。支持状态以对应提交的 Actions 结果为准，不由配置文件的存在决定。
+
+启动前检查会核对 ABI、运行资源、产物清单和目标集成测试收据。未经验证的组合仅在确认没有启动隐私保护和现存 compositor 时，才回退到系统 Shell；此会话的原生接管后端保持关闭。锁保护或会话状态不明时拒绝启动，不自动解除保护。详见 [兼容配置、升级与安全回退](docs/COMPATIBILITY.md)。
 
 ## 获取与测试
 
@@ -76,6 +78,7 @@ cd ubuntu-session-takeover
 | `takeover/login_gateway.py` | 端点校验、提前重定向、目标等待及本地恢复核验 |
 | `takeover/startup_guard.py`、`session_health.py` | 启动等待、网关重注册与监督心跳 |
 | `scripts/native-shell.py`、`native-session.py` | 加载私有 Mutter、启动当前物理会话的后端 |
+| `compat/profiles/`、`takeover/compatibility.py`、`startup_policy.py` | 精确兼容配置、只读启动检查、受约束的系统 Shell 回退 |
 | `patches/` | 固定版本 Mutter / GRD 补丁及发行版来源清单 |
 
 ## 安全与验证边界

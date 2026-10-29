@@ -28,6 +28,11 @@ ALLOWED_UNITS = {SHELL_UNIT, GUARD_UNIT}
 ALLOWED_CODE = {'scripts/native-session.py', 'scripts/finish-login-guard.py',
                 'takeover/startup_guard.py', 'takeover/login_gateway.py',
                 'takeover/native_broker.py', 'scripts/check-native-health.py'}
+ALLOWED_CODE |= {'scripts/native-shell.py', 'scripts/check-compatibility.py',
+                 'takeover/compatibility.py', 'takeover/startup_policy.py',
+                 'build/compatibility-manifest.json', 'build/compatibility-validation.json',
+                 'compat/profiles/ubuntu-26.04-amd64-gnome-50.1.json',
+                 'compat/profiles/ubuntu-26.04-amd64-gnome-50.1-updates-20261029.json'}
 
 
 def exchange(first, second):
@@ -117,6 +122,11 @@ class HandoverRepair:
         changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
         if not changed or any(p not in ALLOWED_CODE and not p.startswith('build/native-prefix/') for p in changed):
             raise RuntimeError('Out-of-scope or empty handover update')
+        if any(p in changed for p in ('scripts/native-shell.py', 'takeover/compatibility.py', 'takeover/startup_policy.py')):
+            required = {'scripts/native-shell.py', 'takeover/compatibility.py', 'takeover/startup_policy.py',
+                        'build/compatibility-manifest.json', 'build/compatibility-validation.json'}
+            if not required.issubset(new['files']):
+                raise RuntimeError('New launcher requires complete final-payload compatibility evidence')
         # The PAM binary is unchanged; do not accidentally replace the local
         # authentication mechanism while repairing compositor state handling.
         helper = 'build/native-prefix/libexec/native-local-auth'
@@ -144,6 +154,7 @@ class HandoverRepair:
                     if not path.is_symlink():
                         path.chmod(0o755 if path.is_dir() or path.stat().st_mode & 0o111 else 0o644)
             self.verify_tree(staged, manifest)
+            self.base.verify_candidate_compatibility(staged)
             return staged
         except Exception:
             shutil.rmtree(staged)

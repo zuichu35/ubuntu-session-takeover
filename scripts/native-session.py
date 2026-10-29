@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from takeover.session_health import backend_listening, GatewayRegistration, Watchdog
 from takeover.greeter_config import grd_environment as greeter_grd_environment
 from takeover.login_gateway import boot_guard_present
+from takeover.startup_policy import confirmed_system_fallback
 from takeover.startup_guard import (READY_STATES, STARTUP_STATES, LocalReclaimRejected,
                                     finish_local_reclaim, wait_startup_ready)
 
@@ -51,6 +52,9 @@ def main():
     os.umask(0o077)
     watchdog = Watchdog()
     watchdog.ping()
+    if confirmed_system_fallback():
+        print(json.dumps({'event': 'native-backend-disabled', 'reason': 'verified-system-shell-fallback'}), flush=True)
+        return
     greeter = '--greeter' in sys.argv
     gateway_enabled = Path('/etc/ubuntu-native-login/config.json').exists()
     if greeter and not gateway_enabled:
@@ -70,6 +74,9 @@ def main():
         state = user_bus.call_sync('org.gnome.Mutter.NativeTakeover', '/org/gnome/Mutter/NativeTakeover',
             'org.gnome.Mutter.NativeTakeover', 'GetState', None, None, 0, 3000, None).unpack()[0]
     except GLib.Error as error:
+        if confirmed_system_fallback(user_bus):
+            print(json.dumps({'event': 'native-backend-disabled', 'reason': 'verified-system-shell-fallback'}), flush=True)
+            return
         raise SystemExit('Native Mutter patch is not loaded; port 3392 cannot start. '
                          'Check journalctl --user -u org.gnome.Shell@ubuntu.service '
                          'for loader/runtime errors. If the launcher was just installed, '
