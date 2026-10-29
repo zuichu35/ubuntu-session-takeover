@@ -38,6 +38,33 @@ def wait_for(test, message, seconds=15):
     raise AssertionError(message)
 
 
+def wait_for_client_window(process, environment, title, seconds=15, *,
+                           run=subprocess.run, sleep=time.sleep, clock=time.monotonic):
+    """Authentication precedes X11 window mapping; wait for the actual client."""
+    import re
+    deadline = clock() + seconds
+    while clock() < deadline:
+        if process.poll() is not None:
+            raise AssertionError(f'RDP client {title} exited with status {process.returncode} before its window was ready')
+        result = run(['xdotool', 'search', '--onlyvisible', '--name', '^' + re.escape(title) + '$'],
+                     env=environment, capture_output=True, text=True, timeout=2)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.splitlines()[-1]
+        sleep(.1)
+    windows = []
+    try:
+        visible = run(['xdotool', 'search', '--onlyvisible', '--name', '.'],
+                      env=environment, capture_output=True, text=True, timeout=2)
+        for identifier in visible.stdout.splitlines()[:20]:
+            name = run(['xdotool', 'getwindowname', identifier], env=environment,
+                       capture_output=True, text=True, timeout=1)
+            windows.append({'id': identifier, 'title': name.stdout.strip()[:200]})
+    except (OSError, subprocess.TimeoutExpired):
+        windows.append({'diagnostic': 'window enumeration unavailable'})
+    raise AssertionError(f'RDP client {title} did not map its window within {seconds}s; '
+                         f'client exit={process.poll()}; visible Xvfb windows={windows}')
+
+
 def stop(p):
     if p.poll() is None:
         p.terminate()

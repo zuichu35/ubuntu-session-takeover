@@ -66,7 +66,7 @@ def main():
             result = subprocess.run(command, cwd=ROOT, env=dict(environment, **(extra or {})),
                                     stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
         if result.returncode:
-            print((logs / (name + '.log')).read_text()[-16000:], file=sys.stderr)
+            print((logs / (name + '.log')).read_text()[-36000:], file=sys.stderr)
             raise RuntimeError(name + ' failed; no passing receipt emitted')
 
     run('fetch', ['/usr/bin/python3', 'scripts/fetch-upstreams.py'])

@@ -35,6 +35,20 @@ harness.ART = ART
 spawn, stop, wait_for = harness.spawn, harness.stop, harness.wait_for
 NAME = 'org.gnome.Mutter.NativeTakeover'
 OBJ = '/org/gnome/Mutter/NativeTakeover'
+SYNTHETIC_SECRETS = set()
+
+
+def failure_diagnostics():
+    # Whitelist only synthetic test process logs. Never dump environment,
+    # credential databases, key files, HOME, or the runtime directory.
+    for name in ('mutter', 'grd', 'broker', 'screen-saver', 'pipewire', 'NativeRDPTest',
+                 'target-mutter', 'target-grd', 'target-broker'):
+        path = ART / (name + '.log')
+        if path.is_file():
+            tail = '\n'.join(path.read_text(errors='replace').splitlines()[-30:])[-3000:]
+            for value in SYNTHETIC_SECRETS:
+                tail = tail.replace(value, '<synthetic-credential-redacted>')
+            print(f'--- isolated test diagnostic: {name} ---\n{tail}', file=sys.stderr, flush=True)
 
 
 def main():
@@ -276,6 +290,7 @@ def main():
                     '-subj', '/CN=native-isolated-test', '-keyout', str(key), '-out', str(cert)],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     password = secrets.token_urlsafe(24)
+    SYNTHETIC_SECRETS.add(password)
     grd_env = dict(env, GSETTINGS_BACKEND='keyfile', GRD_TAKEOVER_SOCKET=str(gate), GRD_NATIVE_TAKEOVER='1',
         GNOME_REMOTE_DESKTOP_TEST_RDP_USERNAME='native-test', GNOME_REMOTE_DESKTOP_TEST_RDP_PASSWORD=password,
         LD_LIBRARY_PATH=str(ROOT / 'vendor/grd-deps/root/usr/lib/x86_64-linux-gnu' if RUNTIME_ROOT == ROOT else RUNTIME_ROOT / 'build/grd-prefix/lib/x86_64-linux-gnu'))
@@ -331,6 +346,7 @@ def main():
         threading.Thread(target=accept,daemon=True).start()
 
     def remote(title, pwd=password):
+        SYNTHETIC_SECRETS.add(pwd)
         return spawn([os.environ.get('NATIVE_TEST_FREERDP', str(ROOT / 'vendor/ubuntu-freerdp/root/usr/bin/xfreerdp')), '/v:127.0.0.1:43392',
                       '/u:native-test', '/p:' + pwd, '/cert:ignore', '/size:1280x720', '/gfx:RFX',
                       '/network:lan', '/title:' + title] +
@@ -357,8 +373,7 @@ def main():
     if '--two-monitors' in sys.argv:
         wait_for(lambda: monitor_count() == 1, 'remote layout was not applied')
     if '--greeter-probe' in sys.argv:
-        time.sleep(3)
-        window = subprocess.check_output(['xdotool','search','--onlyvisible','--name','^NativeRDPTest$'],env=client_env,text=True).splitlines()[-1]
+        window = harness.wait_for_client_window(first, client_env, 'NativeRDPTest')
         for command in (['windowfocus',window], ['type','--clearmodifiers','greeter-input-over-rdp']):
             subprocess.run(['xdotool',*command],env=client_env,check=True)
         wait_for(lambda: json.loads(state_file.read_text())['text'] == 'greeter-input-over-rdp', 'Greeter RDP input failed')
@@ -406,7 +421,7 @@ def main():
             wait_for(target_ready, 'RDP client did not follow native handover', 25)
             assert first.poll() is None, 'Handover terminated client process'
             time.sleep(3)  # Wait for the redirected client's capture/input setup, as for the initial client.
-            window=subprocess.check_output(['xdotool','search','--onlyvisible','--name','^NativeRDPTest$'],env=client_env,text=True).splitlines()[-1]
+            window = harness.wait_for_client_window(first, client_env, 'NativeRDPTest')
             subprocess.run(['xdotool','windowfocus',window],env=client_env,check=True)
             subprocess.run(['xdotool','type','--clearmodifiers','native-after-login'],env=client_env,check=True)
             wait_for(lambda: json.loads(target_app.read_text())['text']=='native-after-login','Redirected input did not reach native desktop')
@@ -425,14 +440,13 @@ def main():
         print(json.dumps(result),flush=True)
         return
     assert inspect_local() == (2 if '--two-monitors' in sys.argv else 1, False), 'physical authentication UI was not drawn'
-    time.sleep(3)
     if '--two-monitors' in sys.argv:
         assert monitor_count() == 1, 'secondary output remained outside the RDP frame'
     assert call('TestInputState') == (0, 0, False), 'physical modifiers/buttons/repeat survived takeover'
 
     def xd(*args):
         return subprocess.check_output(['xdotool', *args], env=client_env, text=True).strip()
-    wid = xd('search', '--onlyvisible', '--name', '^NativeRDPTest$').splitlines()[-1]
+    wid = harness.wait_for_client_window(first, client_env, 'NativeRDPTest')
     xd('windowfocus', wid)
     xd('type', '--clearmodifiers', '--delay', '60', 'native-original-session-123')
     from PIL import ImageGrab
@@ -698,6 +712,9 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except BaseException:
+        failure_diagnostics()
+        raise
     finally:
         for p in reversed(harness.children):
             stop(p)
