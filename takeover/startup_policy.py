@@ -161,7 +161,11 @@ def clean_environment(environment, root, report):
         if key not in result:
             continue
         parts = re.split(r'[:\s]+', result[key]) if key in ('LD_PRELOAD', 'LD_AUDIT') else result[key].split(':')
-        kept = [p for p in parts if p and not _private_path(p, root, report)]
+        # A bare preload/audit SONAME is resolved by the dynamic loader, not
+        # relative to cwd. Keep it so private startup can reject the ambiguity.
+        loader_names = key in ('LD_PRELOAD', 'LD_AUDIT')
+        kept = [p for p in parts if p and
+                ((loader_names and '/' not in p) or not _private_path(p, root, report))]
         if kept:
             result[key] = ':'.join(kept)
         else:

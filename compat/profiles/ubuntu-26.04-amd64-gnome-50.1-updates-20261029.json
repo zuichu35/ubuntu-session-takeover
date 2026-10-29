@@ -185,5 +185,26 @@
     "Only this exact package tuple is eligible; no arbitrary GNOME 50.x or cross-ABI support.",
     "This profile alone does not contain a passing test receipt.",
     "New distribution target candidate: source baseline remains upstream 50.1 plus the explicitly listed 2.4 backports, not the full Ubuntu 2.5 source patchset."
+  ],
+  "runtime_code": [
+    "takeover/__init__.py",
+    "takeover/native_broker.py",
+    "takeover/monitor_layout.py",
+    "takeover/remote_settings.py",
+    "takeover/remote_settings_ui.py",
+    "takeover/login_gateway.py",
+    "takeover/session_health.py",
+    "takeover/greeter_identity.py",
+    "takeover/greeter_config.py",
+    "takeover/startup_guard.py",
+    "takeover/compatibility.py",
+    "takeover/startup_policy.py",
+    "scripts/native-shell.py",
+    "scripts/native-session.py",
+    "scripts/finish-login-guard.py"
+  ],
+  "shell_linkage_files": [
+    "/usr/bin/gnome-shell",
+    "/usr/lib/gnome-shell/libshell-18.so"
   ]
 }

@@ -21,6 +21,21 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def write_verified_receipt(path, receipt, profile, facts, inspect):
+    from takeover.compatibility import evaluate
+    report = evaluate(profile, dict(facts, receipt=receipt))
+    if report['status'] != 'verified':
+        raise RuntimeError('Candidate cannot receive a validation receipt: ' + '; '.join(report['reasons']))
+    path.write_text(json.dumps(receipt, indent=2) + '\n')
+    try:
+        report = inspect()
+        if report['status'] != 'verified':
+            raise RuntimeError('Written receipt failed final verification: ' + '; '.join(report['reasons']))
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
 def main():
     if os.geteuid() == 0 or not Path('/.dockerenv').is_file():
         raise SystemExit('Run this target job as an ordinary user in the dedicated CI container')
@@ -66,6 +81,20 @@ def main():
     manifest = json.loads(manifest_path.read_text())
     profile = json.loads((ROOT / 'compat/profiles' / (PROFILE + '.json')).read_text())
     manifest_hash = digest(manifest_path)
+    sys.path.insert(0, str(ROOT))
+    from takeover.compatibility import collect_snapshot, inspect_candidate
+
+    def verify_inventory():
+        facts = collect_snapshot(ROOT, profile, required_owner=os.getuid(),
+                                 profile_sha256=manifest['profile_sha256'])
+        if facts['errors'] or not manifest.get('private_inventory') or \
+                facts.get('private_inventory') != manifest['private_inventory']:
+            raise RuntimeError('Complete private runtime inventory changed during validation: ' +
+                               '; '.join(facts['errors']))
+        if not manifest.get('shell_linkage') or facts.get('shell_linkage') != manifest['shell_linkage']:
+            raise RuntimeError('Target Shell ELF linkage changed during validation')
+
+    verify_inventory()
     tested_hashes = {
         **{'runtime:' + name: digest(ROOT / name) for name in profile['tested_runtime']},
         **{'system:' + name: digest(name) for name in profile['tested_system']}}
@@ -97,6 +126,7 @@ def main():
                           for path in directory.rglob('*result.json')}
         if not evidence[name]:
             raise RuntimeError(name + ' produced no result evidence')
+        verify_inventory()
     shell = json.loads((WORK / 'shell/native-shell-integration-result.json').read_text())
     startup = json.loads((WORK / 'startup/startup-lock/result.json').read_text())
     gateway = json.loads((WORK / 'gateway/greeter-integration-result.json').read_text())
@@ -119,6 +149,7 @@ def main():
             raise RuntimeError('Real target Shell file was not loaded: ' + absolute)
     if digest(manifest_path) != manifest_hash:
         raise RuntimeError('Build manifest changed during validation')
+    verify_inventory()
     for relative, expected in manifest['artifacts'].items():
         if digest(ROOT / relative) != expected:
             raise RuntimeError('Runtime changed during validation: ' + relative)
@@ -134,7 +165,10 @@ def main():
             'Private fake logind/GDM; real GNOME Shell ScreenShield',
             'Test authentication helper; real PAM and GDM cold boot unverified',
             'No physical GPU/display/input or Windows/macOS client acceptance']}
-    receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+    facts = collect_snapshot(ROOT, profile, required_owner=os.getuid(),
+                             profile_sha256=manifest['profile_sha256'])
+    write_verified_receipt(receipt_path, receipt, profile, facts,
+        lambda: inspect_candidate(ROOT, required_owner=os.getuid(), profile_id=PROFILE))
     print(json.dumps(receipt, indent=2))
 
 

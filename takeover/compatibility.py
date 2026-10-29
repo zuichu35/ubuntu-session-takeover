@@ -32,7 +32,7 @@ def _within(path, anchor):
     return path == anchor or path.is_relative_to(anchor)
 
 
-def trusted_read(path, anchor, required_owner=0):
+def trusted_location(path, anchor, required_owner=0):
     """Check both symlink and resolved ancestry before reading a regular file.
 
     Production requires root-owned, non-writable ancestry all the way to /.
@@ -40,25 +40,101 @@ def trusted_read(path, anchor, required_owner=0):
     tree and root's sticky /tmp. Such reports cannot authorize production.
     """
     path, anchor = Path(path).absolute(), Path(anchor).absolute()
-    resolved = path.resolve(strict=True)
-    if not _within(resolved, anchor.resolve(strict=True)):
+    if not _within(path, anchor):
         raise CompatibilityError('Path escapes its trusted root: ' + str(path))
-    for candidate in {path, resolved}:
-        for part in [candidate, *candidate.parents]:
-            info = part.lstat()
-            if info.st_uid not in ({0} if required_owner == 0 else {0, required_owner}):
-                raise CompatibilityError('Unexpected path owner: ' + str(part))
-            if not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022:
-                developer_tmp = (required_owner != 0 and stat.S_ISDIR(info.st_mode)
-                                 and info.st_uid == 0 and info.st_mode & stat.S_ISVTX)
-                developer_group = (required_owner != 0 and info.st_uid == required_owner
-                                   and not info.st_mode & 0o002)
-                if not (developer_tmp or developer_group):
-                    raise CompatibilityError('Writable trusted path: ' + str(part))
-    info = resolved.stat()
+
+    def check(part):
+        info = part.lstat()
+        if info.st_uid not in ({0} if required_owner == 0 else {0, required_owner}):
+            raise CompatibilityError('Unexpected path owner: ' + str(part))
+        if not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022:
+            developer_tmp = (required_owner != 0 and stat.S_ISDIR(info.st_mode)
+                             and info.st_uid == 0 and info.st_mode & stat.S_ISVTX)
+            developer_group = (required_owner != 0 and info.st_uid == required_owner
+                               and not info.st_mode & 0o002)
+            if not (developer_tmp or developer_group):
+                raise CompatibilityError('Writable trusted path: ' + str(part))
+        return info
+
+    # Walk every symlink hop. Checking only final resolve() would miss a jump
+    # through a writable outside directory which happens to point back inside.
+    resolved, pending, hops = Path('/'), list(path.parts[1:]), 0
+    check(resolved)
+    while pending:
+        name = pending.pop(0)
+        if name in ('', '.'):
+            continue
+        if name == '..':
+            parent = resolved.parent
+            if _within(resolved, anchor) and not _within(parent, anchor):
+                raise CompatibilityError('Symlink traversal escapes its trusted root: ' + str(path))
+            resolved = parent
+            continue
+        part = resolved / name
+        info = check(part)
+        if stat.S_ISLNK(info.st_mode):
+            hops += 1
+            if hops > 40:
+                raise CompatibilityError('Too many symlink hops: ' + str(path))
+            target = part.readlink()
+            if anchor != Path('/') and (not _within(part, anchor) or target.is_absolute()):
+                raise CompatibilityError('Symlink escapes or precedes its trusted root: ' + str(path))
+            if target.is_absolute():
+                resolved = Path('/')
+                pending = list(target.parts[1:]) + pending
+            else:
+                pending = list(target.parts) + pending
+        else:
+            resolved = part
+    if not _within(resolved, anchor):
+        raise CompatibilityError('Path escapes its trusted root: ' + str(path))
+    return resolved, resolved.stat()
+
+
+def trusted_read(path, anchor, required_owner=0):
+    resolved, info = trusted_location(path, anchor, required_owner)
     if not stat.S_ISREG(info.st_mode) or info.st_size > 128 * 1024 * 1024:
         raise CompatibilityError('Expected a bounded regular file: ' + str(path))
     return resolved.read_bytes()
+
+
+def private_inventory(root, profile, required_owner=0):
+    """Bind all prefix files/links and the profile's executed Python runtime code."""
+    root = Path(root).absolute()
+    files, links = {}, {}
+    for key in ('native_prefix', 'grd_prefix'):
+        prefix = root / profile['paths'][key]
+        if prefix.is_symlink() or not prefix.is_dir():
+            raise CompatibilityError('Private prefix must be a real directory: ' + str(prefix))
+        trusted_location(prefix, root, required_owner)
+        def failed_walk(error):
+            raise CompatibilityError('Cannot inspect private directory: ' + str(error.filename))
+        for current, directories, names in os.walk(prefix, followlinks=False, onerror=failed_walk):
+            directory = Path(current)
+            trusted_location(directory, prefix, required_owner)
+            directories.sort()
+            names.sort()
+            for name in [*directories, *names]:
+                path = directory / name
+                relative = path.relative_to(root).as_posix()
+                _, info = trusted_location(path, prefix, required_owner)
+                if path.is_symlink():
+                    target = path.readlink()
+                    if target.is_absolute():
+                        raise CompatibilityError('Private symlink must be relative: ' + relative)
+                    links[relative] = str(target)
+                    if name in directories:
+                        directories.remove(name)
+                elif stat.S_ISREG(info.st_mode):
+                    files[relative] = sha256(trusted_read(path, prefix, required_owner))
+                elif not stat.S_ISDIR(info.st_mode):
+                    raise CompatibilityError('Unexpected private-prefix file type: ' + relative)
+    for relative in profile.get('runtime_code', []):
+        path = root / relative
+        if path.is_symlink():
+            raise CompatibilityError('Runtime code must be a regular file: ' + relative)
+        files[relative] = sha256(trusted_read(path, root, required_owner))
+    return {'files': files, 'symlinks': links}
 
 
 def elf_metadata(raw):
@@ -158,7 +234,8 @@ def load_profile(root, profile_id=DEFAULT_PROFILE, required_owner=0):
     profile = json.loads(raw)
     if profile.get('schema') != 1 or profile.get('id') != profile_id:
         raise CompatibilityError('Invalid compatibility profile')
-    for relative in [*profile['paths'].values(), *(x['path'] for x in profile['artifacts'])]:
+    for relative in [*profile['paths'].values(), *(x['path'] for x in profile['artifacts']),
+                     *profile.get('runtime_code', [])]:
         if not isinstance(relative, str) or Path(relative).is_absolute() or '..' in Path(relative).parts:
             raise CompatibilityError('Unsafe profile relative path')
     return profile, sha256(raw)
@@ -183,7 +260,8 @@ def collect_snapshot(root, profile, *, system_root=Path('/'), required_owner=0,
              'expected_runtime_prefix': str(runtime_prefix or root),
              'staged': runtime_prefix is not None and str(runtime_prefix) != str(root),
              'production_eligible': required_owner == 0, 'errors': [], 'diagnostics': [],
-             'artifacts': {}, 'elf': {}, 'system_hashes': {}, 'typelibs': {},
+             'artifacts': {}, 'private_inventory': None, 'elf': {}, 'shell_linkage': {},
+             'system_hashes': {}, 'typelibs': {},
              'manifest': None, 'manifest_sha256': None, 'receipt': None}
 
     def read(path, anchor):
@@ -215,8 +293,13 @@ def collect_snapshot(root, profile, *, system_root=Path('/'), required_owner=0,
         for absolute in profile['system_files']:
             raw = read(system_root / absolute.lstrip('/'), system_root)
             facts['system_hashes'][absolute] = sha256(raw)
+            metadata = None
+            if absolute in profile['shell_linkage_files']:
+                metadata = elf_metadata(raw)
+                facts['shell_linkage'][absolute] = {key: metadata[key]
+                                                   for key in ('machine', 'needed', 'soname', 'runpaths')}
             if absolute == profile['shell_binary']:
-                facts['shell_elf'] = elf_metadata(raw)
+                facts['shell_elf'] = metadata or elf_metadata(raw)
                 matches = [re.fullmatch(r'libmutter-(\d+)\.so\.0', name)
                            for name in facts['shell_elf']['needed']]
                 abis = [match.group(1) for match in matches if match]
@@ -224,6 +307,7 @@ def collect_snapshot(root, profile, *, system_root=Path('/'), required_owner=0,
                     raise CompatibilityError('Shell does not declare exactly one Mutter SONAME ABI')
                 facts['target']['mutter_abi'] = abis[0]
         compiled_root = str(runtime_prefix or (facts['manifest'] or {}).get('runtime_prefix') or root)
+        facts['private_inventory'] = private_inventory(root, profile, required_owner)
         for artifact in profile['artifacts']:
             relative = artifact['path']
             path = root / relative
@@ -294,8 +378,16 @@ def _evaluate(profile, facts):
         recorded = manifest.get('artifacts')
         if not isinstance(recorded, dict) or recorded != facts.get('artifacts') or not recorded:
             reasons.append('Runtime files differ from the build manifest')
+        inventory = manifest.get('private_inventory')
+        if (not isinstance(inventory, dict) or not isinstance(inventory.get('files'), dict)
+                or not inventory['files'] or not isinstance(inventory.get('symlinks'), dict)
+                or inventory != facts.get('private_inventory')):
+            reasons.append('Complete private-prefix inventory differs from the build manifest')
         if manifest.get('built_for') != target:
             pending.append('Installed target differs from the build target')
+        if (set(facts.get('shell_linkage', {})) != set(profile['shell_linkage_files'])
+                or manifest.get('shell_linkage') != facts.get('shell_linkage')):
+            pending.append('Actual Shell/libshell dynamic linkage needs validation')
         for name, old in manifest.get('system_hashes', {}).items():
             if facts.get('system_hashes', {}).get(name) != old:
                 diagnostics.append('System fingerprint changed (diagnostic only): ' + name)
@@ -374,10 +466,18 @@ def build_manifest(profile, facts, *, runtime_prefix, sources):
     expected = {item['path'] for item in profile['artifacts']}
     if set(facts.get('artifacts', {})) != expected or sources != profile['sources']:
         raise CompatibilityError('Build artifacts or source baseline do not match the profile')
+    inventory = facts.get('private_inventory')
+    if (not isinstance(inventory, dict) or not isinstance(inventory.get('files'), dict)
+            or not inventory['files'] or not isinstance(inventory.get('symlinks'), dict)):
+        raise CompatibilityError('Missing complete private-prefix inventory')
+    if set(facts.get('shell_linkage', {})) != set(profile['shell_linkage_files']):
+        raise CompatibilityError('Missing actual Shell/libshell dynamic linkage')
     if not Path(runtime_prefix).is_absolute():
         raise CompatibilityError('Compiled runtime prefix must be absolute')
     return json.loads(json.dumps({'schema': 1, 'profile_id': profile['id'],
                                   'profile_sha256': facts['profile_sha256'],
                                   'runtime_prefix': str(runtime_prefix), 'built_for': facts['target'],
                                   'artifacts': facts['artifacts'], 'system_hashes': facts['system_hashes'],
+                                  'private_inventory': inventory,
+                                  'shell_linkage': facts['shell_linkage'],
                                   'sources': sources}))

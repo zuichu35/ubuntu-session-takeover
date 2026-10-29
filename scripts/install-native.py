@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare next login to use the native patch; never restart the current shell."""
+"""Historical per-user installer; disabled in the compatibility-gated release."""
 import hashlib
 import json
 import os
@@ -17,7 +17,7 @@ DATA = Path.home() / '.local/share/ubuntu-native-takeover'
 USER = Path.home() / '.config/systemd/user'
 
 
-def main():
+def _legacy_main():
     candidate = inspect_candidate(ROOT, required_owner=0)
     if candidate.get('status') != 'verified' or candidate.get('production_eligible') is not True:
         raise RuntimeError('Activation requires a root-managed, validated runtime: ' + json.dumps(candidate))
@@ -114,6 +114,13 @@ def main():
             subprocess.run(['systemctl', '--user', 'disable', *enabled], check=True)
     subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
     print('Native takeover installed for the next Ubuntu login. Current compositor was not restarted. Port: 3392')
+
+
+def main():
+    raise RuntimeError('The historical per-user installer is disabled. Its user-owned runtime and '
+                       'legacy evidence are incompatible with the root-managed startup gate. '
+                       'Use a validated final-prefix maintainer bundle; see docs/COMPATIBILITY.md. '
+                       'No user configuration or service was changed.')
 
 
 if __name__ == '__main__':

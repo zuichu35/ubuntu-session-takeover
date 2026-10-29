@@ -24,8 +24,9 @@ Three inputs must agree:
 
 1. The profile declares exact target versions, SONAMEs, exported symbols,
    typelib library names, source revisions and patch checksums.
-2. `build/compatibility-manifest.json` binds the final artifact hashes and
-   compiled resource prefix to the observed target and source baseline.
+2. `build/compatibility-manifest.json` binds the complete private-prefix file
+   and symlink inventory, required Python runtime code, Shell/libshell dynamic
+   linkage and compiled resource prefix to the observed target and source baseline.
 3. `build/compatibility-validation.json` binds successful required target
    cases and actual tested binaries to that manifest.
 
@@ -35,6 +36,9 @@ wrong ABI, corrupt artifacts or unsafe paths are incompatible. Changes to
 system file fingerprints are diagnostic and do not by themselves establish
 compatibility or incompatibility. Production also requires root ownership
 and nonwritable ancestry for policy, evidence and runtime files.
+Changes to the actual Shell/libshell dependency list or loader paths require
+new validation even if the package version string stays the same. This static
+inspection is not a full implementation of the operating system's dynamic loader.
 
 Read-only checks do not load libraries, start a Shell, access credentials or
 change services:
@@ -98,10 +102,18 @@ development runtime does not authorize an `/opt` deployment. The final `/opt`
 candidate must be tested at its compiled prefix in an isolated environment.
 
 Packaging copies the compatibility policy and discards stale build/validation
-receipts. Maintainer installers refuse to activate a new-policy runtime until
+receipts. After testing the final prefix, run
+`python3 scripts/finalize-compatibility-bundle.py /path/to/bundle` to add the
+two valid receipts to its outer payload manifest. This step rejects changes
+to any previously packaged file and does not invent passing evidence. Do not
+rerun the assembler after validation: that creates another unvalidated payload.
+The historical `.deb` assembler produces a development candidate only; it has
+no supported validation/finalization/release pipeline in this revision.
+Maintainer installers refuse to activate a new-policy runtime until
 its complete, root-managed staged payload passes inspection against the target
-system. The historical package setup and developer activation entry points
-also require this gate. This repository still has no supported fresh-machine
+system. The historical package setup also requires this gate. The old
+`install-native.py` per-user installer is disabled because it writes to a
+user-owned runtime and relies on obsolete evidence paths. This repository still has no supported fresh-machine
 installer or precompiled release.
 
 To add a new version, add a separate exact profile, port the source as needed,

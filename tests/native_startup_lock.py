@@ -41,6 +41,7 @@ class Desktop:
         for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'DBUS_SESSION_BUS_ADDRESS', 'DCONF_PROFILE',
                     'GSETTINGS_SCHEMA_DIR', 'NOTIFY_SOCKET', 'WATCHDOG_USEC', 'WATCHDOG_PID'):
             env.pop(key, None)
+        env['DBUS_SYSTEM_BUS_ADDRESS'] = 'unix:path=' + str(self.run / 'unavailable-system-bus')
         bus = subprocess.Popen(['dbus-daemon', '--session', '--nofork', '--print-address=1'],
                                env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.children.append(bus)

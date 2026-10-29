@@ -25,8 +25,14 @@ def verified_facts(profile, digest):
     system = {name: hashlib.sha256(name.encode()).hexdigest() for name in profile['system_files']}
     facts = {'paths': compat.runtime_paths('/opt/fixture', profile), 'production_eligible': True,
              'profile_sha256': digest, 'target': copy.deepcopy(profile['target']),
-             'artifacts': artifacts, 'system_hashes': system, 'errors': [], 'diagnostics': [],
+             'artifacts': artifacts, 'private_inventory': {'files': dict(artifacts), 'symlinks': {}},
+             'system_hashes': system, 'errors': [], 'diagnostics': [],
              'shell_elf': {'machine': 62, 'needed': profile['shell_needed']}, 'elf': {}, 'typelibs': {}}
+    facts['private_inventory']['files'].update({name: hashlib.sha256(name.encode()).hexdigest()
+                                               for name in profile['runtime_code']})
+    facts['shell_linkage'] = {name: {'machine': 62, 'needed': list(profile['shell_needed']),
+                                    'soname': None, 'runpaths': []}
+                              for name in profile['shell_linkage_files']}
     for item in profile['artifacts']:
         if item['kind'] == 'elf':
             facts['elf'][item['path']] = {'machine': 62, 'soname': item.get('soname'), 'exports': item.get('exports', [])}
@@ -86,6 +92,15 @@ class Decisions(unittest.TestCase):
         self.assertEqual(report['status'], 'verified')
         self.assertTrue(any('fingerprint changed' in message for message in report['diagnostics']))
 
+    def test_shell_new_dependency_or_libshell_runpath_drift_needs_validation(self):
+        for absolute, field, value in (('/usr/bin/gnome-shell', 'needed', 'libmissing-new.so.0'),
+                                       ('/usr/lib/gnome-shell/libshell-18.so', 'runpaths', '/new/library/path')):
+            with self.subTest(path=absolute):
+                facts = copy.deepcopy(self.facts)
+                facts['shell_linkage'][absolute][field].append(value)
+                facts['system_hashes'][absolute] = 'a' * 64
+                self.assertEqual(compat.evaluate(self.profile, facts)['status'], 'needs-validation')
+
     def test_missing_or_corrupt_build_manifest_is_incompatible(self):
         for value in (None, [], {'schema': 1}, {'schema': 2}):
             with self.subTest(value=value):
@@ -94,6 +109,29 @@ class Decisions(unittest.TestCase):
 
     def test_runtime_corruption_is_incompatible(self):
         self.facts['artifacts'][self.profile['tested_runtime'][0]] = 'e' * 64
+        self.assertEqual(self.report()['status'], 'incompatible')
+
+    def test_added_loadable_library_not_in_profile_invalidates_receipt(self):
+        self.facts['private_inventory']['files']['build/native-prefix/lib/x86_64-linux-gnu/libgio-2.0.so.0'] = 'c' * 64
+        self.assertEqual(self.report()['status'], 'incompatible')
+
+    def test_gateway_python_change_invalidates_same_binary_receipt(self):
+        self.facts['private_inventory']['files']['takeover/login_gateway.py'] = 'd' * 64
+        self.assertEqual(self.report()['status'], 'incompatible')
+
+    def test_removed_unlisted_file_or_symlink_change_invalidates_receipt(self):
+        name = 'build/native-prefix/lib/x86_64-linux-gnu/plugin.so'
+        for before, after in (({'files': {name: 'a' * 64}, 'symlinks': {}},
+                               {'files': {}, 'symlinks': {}}),
+                              ({'files': {name: 'a' * 64}, 'symlinks': {name + '.0': 'plugin.so'}},
+                               {'files': {name: 'a' * 64}, 'symlinks': {name + '.0': 'other.so'}})):
+            with self.subTest(after=after):
+                self.facts['manifest']['private_inventory'] = before
+                self.facts['private_inventory'] = after
+                self.assertEqual(self.report()['status'], 'incompatible')
+
+    def test_old_partial_inventory_manifest_cannot_verify(self):
+        self.facts['manifest'].pop('private_inventory')
         self.assertEqual(self.report()['status'], 'incompatible')
 
     def test_wrong_typelib_or_missing_export_is_incompatible(self):
@@ -141,6 +179,45 @@ class Decisions(unittest.TestCase):
 
 
 class ReadOnlyParsers(unittest.TestCase):
+    def test_inventory_covers_unlisted_files_and_link_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = {'paths': {'native_prefix': 'native', 'grd_prefix': 'grd'}}
+            for name in ('native', 'grd'):
+                (root / name).mkdir()
+                (root / name / 'data').write_bytes(b'data')
+            (root / 'native/lib').mkdir()
+            library = root / 'native/lib/libgio-2.0.so.0'
+            library.write_bytes(b'additional private dependency')
+            link = root / 'native/lib/libgio.so'
+            link.symlink_to('libgio-2.0.so.0')
+            inventory = compat.private_inventory(root, profile, os.getuid())
+            self.assertIn('native/lib/libgio-2.0.so.0', inventory['files'])
+            self.assertEqual(inventory['symlinks']['native/lib/libgio.so'], 'libgio-2.0.so.0')
+            (root / 'native/lib/same-bytes.so').write_bytes(library.read_bytes())
+            link.unlink()
+            link.symlink_to('same-bytes.so')
+            self.assertNotEqual(inventory, compat.private_inventory(root, profile, os.getuid()))
+            link.unlink()
+            link.symlink_to(root / 'native/data')
+            with self.assertRaisesRegex(compat.CompatibilityError, 'relative|escapes'):
+                compat.private_inventory(root, profile, os.getuid())
+            link.unlink()
+            link.symlink_to('../../grd/data')
+            with self.assertRaisesRegex(compat.CompatibilityError, 'escapes'):
+                compat.private_inventory(root, profile, os.getuid())
+
+    def test_symlink_cannot_leave_anchor_then_return_through_another_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            safe = root / 'safe'
+            safe.mkdir()
+            (safe / 'real').write_text('fixture')
+            (root / 'hop').symlink_to('safe/real')
+            (safe / 'resource').symlink_to('../hop')
+            self.assertEqual((safe / 'resource').resolve(), safe / 'real')
+            with self.assertRaisesRegex(compat.CompatibilityError, 'escapes'):
+                compat.trusted_read(safe / 'resource', safe, os.getuid())
     def test_static_elf_needed_soname_and_architecture(self):
         data = bytearray(768)
         data[:6] = b'\x7fELF\x02\x01'

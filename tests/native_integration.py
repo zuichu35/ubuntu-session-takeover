@@ -89,6 +89,7 @@ def main():
     for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'DBUS_SESSION_BUS_ADDRESS', 'SESSION_MANAGER',
                 'PIPEWIRE_REMOTE', 'PIPEWIRE_RUNTIME_DIR', 'DCONF_PROFILE', 'GSETTINGS_SCHEMA_DIR'):
         env.pop(key, None)
+    env['DBUS_SYSTEM_BUS_ADDRESS'] = 'unix:path=' + str(RUN / 'unavailable-system-bus')
     bus = subprocess.Popen(['dbus-daemon', '--session', '--nofork', '--print-address=1'], env=env,
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     harness.children.append(bus)

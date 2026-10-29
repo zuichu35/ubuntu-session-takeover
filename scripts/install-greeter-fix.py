@@ -208,9 +208,16 @@ class Installer:
                 raise RuntimeError('System ABI changed; rebuild the candidate before installing: ' + absolute)
         return manifest, digest(manifest_path)
 
-    def verify_prefix(self, manifest):
-        prefix = self.path(PREFIX)
+    def verify_prefix(self, manifest, prefix=None):
+        # Historical rollback callers deliberately verify an unchanged subset;
+        # newly staged trees must match the complete candidate inventory.
+        complete_inventory = prefix is not None
+        prefix = self.path(PREFIX) if prefix is None else prefix
         self.no_symlink_path(prefix)
+        found = {p.relative_to(prefix).as_posix() for p in prefix.rglob('*')
+                 if p.is_symlink() or not p.is_dir()}
+        if complete_inventory and found != set(manifest['files']) | set(manifest.get('symlinks', {})):
+            raise RuntimeError('Installed candidate inventory changed')
         for relative, expected_hash in manifest['files'].items():
             path = prefix / relative
             if path.is_symlink() or not path.is_file() or digest(path) != expected_hash:
@@ -312,6 +319,7 @@ NotifyAccess=main
                     os.chown(path, self.owner_uid, self.owner_gid, follow_symlinks=False)
                     if not path.is_symlink():
                         path.chmod(0o755 if path.is_dir() or path.stat().st_mode & 0o111 else 0o644)
+            self.verify_prefix(manifest, prefix=temporary)
             self.verify_candidate_compatibility(temporary)
             os.rename(temporary, destination)
             self.verify_prefix(manifest)

@@ -38,3 +38,13 @@ jobs:
           else
             printf 'Target build or integration failed; no passing validation receipt was produced.\n' >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Preserve only compatibility metadata
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: target-compatibility-metadata
+          path: |
+            build/compatibility-manifest.json
+            build/compatibility-validation.json
+          if-no-files-found: ignore
+          retention-days: 14

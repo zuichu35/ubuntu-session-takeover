@@ -95,6 +95,28 @@ class CompatibilityTests(unittest.TestCase):
                 self.launcher.main(['/usr/bin/gnome-shell'])
             execute.assert_not_called()
 
+    def test_private_rejects_preload_and_audit_before_exec_or_receipt(self):
+        for guard in ('absent', 'present'):
+            self.context['guard'] = guard
+            for name, value in [('LD_PRELOAD', 'libmutter-18.so.0'),
+                                ('LD_PRELOAD', '/usr/lib/libmutter-18.so.0'),
+                                ('LD_PRELOAD', '/opt/wrapper/preload.so'),
+                                ('LD_AUDIT', 'audit-wrapper.so')]:
+                with self.subTest(guard=guard, variable=name, value=value), \
+                     patch.dict(os.environ, {name: value}), \
+                     patch.object(policy, 'write_launch_receipt') as receipt, \
+                     patch.object(self.launcher.os, 'execvpe') as execute:
+                    with self.assertRaisesRegex(SystemExit, 'Unverified LD_PRELOAD or LD_AUDIT'):
+                        self.launcher.main(['/original-wrapper', '/usr/bin/gnome-shell'])
+                    receipt.assert_not_called()
+                    execute.assert_not_called()
+
+    def test_system_fallback_preserves_unrelated_preload_and_bare_audit(self):
+        self.report['status'] = 'needs-validation'
+        (_, _, env), _ = self.execute(LD_PRELOAD='wrapper-preload.so', LD_AUDIT='/opt/wrapper/audit.so')
+        self.assertEqual(env['LD_PRELOAD'], 'wrapper-preload.so')
+        self.assertEqual(env['LD_AUDIT'], '/opt/wrapper/audit.so')
+
     def test_unknown_state_and_existing_compositor_never_exec_either_mode(self):
         for status in ('verified', 'incompatible'):
             self.report['status'] = status

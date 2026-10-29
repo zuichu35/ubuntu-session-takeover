@@ -1,9 +1,12 @@
 """Packaging must not turn evidence for a different binary into activation."""
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -82,6 +85,59 @@ class CompatibilityPackaging(unittest.TestCase):
             # No import cache or install/configuration outputs may be created.
             self.assertEqual(sorted(p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()),
                              ['takeover/compatibility.py'])
+
+    def test_staging_copy_is_rechecked_before_executing_policy_or_publishing(self):
+        installer = load('install-greeter-fix')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = object.__new__(installer.Installer)
+            base.root = root
+            base.owner_uid, base.owner_gid = os.getuid(), os.getgid()
+            base.package = root / 'package'
+            policy = base.package / 'payload/takeover/compatibility.py'
+            policy.parent.mkdir(parents=True)
+            policy.write_text('original policy')
+            manifest = {'files': {'takeover/compatibility.py': installer.digest(policy)}, 'symlinks': {}}
+            copy = shutil.copytree
+            def corrupt_copy(source, destination, *args, **kwargs):
+                result = copy(source, destination, *args, **kwargs)
+                if Path(source) == base.package / 'payload':
+                    (destination / 'takeover/compatibility.py').write_text('modified during copy')
+                return result
+            with patch.object(installer.shutil, 'copytree', side_effect=corrupt_copy), \
+                    patch.object(base, 'verify_candidate_compatibility') as inspect:
+                with self.assertRaisesRegex(RuntimeError, 'candidate changed'):
+                    base.stage_prefix(manifest)
+                inspect.assert_not_called()
+            self.assertFalse(base.path(installer.PREFIX).exists())
+
+    def test_finalization_only_seals_validated_receipts_without_changing_payload(self):
+        finalizer = load('finalize-compatibility-bundle')
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            payload = bundle / 'payload'
+            payload.mkdir()
+            (payload / 'binary').write_text('tested binary')
+            anchor = bundle / 'payload-manifest.json'
+            anchor.write_text(json.dumps(finalizer.inventory(payload)))
+            original = anchor.read_bytes()
+            (payload / 'build').mkdir()
+            (payload / finalizer.MANIFEST).write_text(json.dumps({'runtime_prefix': '/opt/final'}))
+            (payload / finalizer.VALIDATION).write_text('{}')
+            with patch.object(finalizer, 'inspect_candidate', return_value={'status': 'needs-validation'}):
+                with self.assertRaisesRegex(RuntimeError, 'has not passed'):
+                    finalizer.finalize(bundle)
+            self.assertEqual(anchor.read_bytes(), original)
+            (payload / 'binary').write_text('changed after testing')
+            with patch.object(finalizer, 'inspect_candidate') as inspect:
+                with self.assertRaisesRegex(RuntimeError, 'packaged files changed'):
+                    finalizer.finalize(bundle)
+                inspect.assert_not_called()
+            (payload / 'binary').write_text('tested binary')
+            with patch.object(finalizer, 'inspect_candidate', return_value={'status': 'verified', 'profile_id': 'fixture'}):
+                report = finalizer.finalize(bundle)
+            self.assertFalse(report['deployment_authorized'])
+            self.assertEqual(json.loads(anchor.read_text()), finalizer.inventory(payload))
 
 
 if __name__ == '__main__':

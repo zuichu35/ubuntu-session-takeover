@@ -71,6 +71,8 @@ def main(args=None):
             raise policy.StartupRefused('Session ownership changed during startup verification')
         env = policy.clean_environment(os.environ, ROOT, report)
         if mode == 'private':
+            if any(env.get(name) for name in ('LD_PRELOAD', 'LD_AUDIT')):
+                raise policy.StartupRefused('Unverified LD_PRELOAD or LD_AUDIT could override the private compositor')
             selected = private_environment(report)
             # Keep unrelated wrapper paths, after the verified private paths.
             for key in ('LD_LIBRARY_PATH', 'GI_TYPELIB_PATH'):

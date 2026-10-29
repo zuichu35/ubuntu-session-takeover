@@ -12,7 +12,7 @@ RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod 755 /usr/sbi
       ca-certificates git build-essential pkgconf meson ninja-build gettext python3-docutils \
       python3 python3-gi python3-cairo python3-pil \
       gnome-shell libmutter-18-0 gir1.2-mutter-18 gnome-remote-desktop \
-      libpam0g-dev glslc spirv-tools dbus-daemon pipewire wireplumber \
+      libpam0g-dev libfdk-aac-dev libvncserver-dev glslc spirv-tools dbus-daemon pipewire wireplumber \
       xvfb xdotool openssl iproute2 util-linux gir1.2-gtk-4.0 freerdp-x11 \
       libgl1-mesa-dri libegl-mesa0 mesa-utils \
  && apt-get build-dep -y mutter gnome-remote-desktop \

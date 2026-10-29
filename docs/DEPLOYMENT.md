@@ -10,7 +10,8 @@
 |---|---|
 | `check-native-health.py` | 默认只读；`--tls` 仅在空闲时进行协议探测，不能证明桌面登录成功 |
 | `check-compatibility.py`、`native-shell.py --check` | 只读检查精确兼容配置、ABI、文件归属、最终产物和目标测试收据 |
-| `install-native.py` | 依赖匹配的本机集成测试和既有凭据；用于开发部署，不是完整初始安装器 |
+| `install-native.py` | 历史用户目录安装器已禁用；不满足新启动门禁的 root 管理要求 |
+| `finalize-compatibility-bundle.py` | 最终产物测试通过后封装两份兼容收据；禁止同时改变既有包文件 |
 | `package-native.py`、`packaging/control.py` | 实验打包/交互设置工具；必须先审核依赖、测试证据与目标布局 |
 | `install-greeter-fix.py`、`install-greeter-startup-fix.py`、`install-handover-fix.py` | 有精确旧清单和原始备份的既有安装升级，缺失前置状态应拒绝执行 |
 | `build-greeter-fix.py`、`build-handover-fix.py` | 对应维护 bundle 的组包工具；后者依赖旧 bundle，不能用于空目录 bootstrap |
@@ -30,6 +31,12 @@
 未验证组合只有在确认无隐私 guard、无现存 compositor 时才回退系统 Shell，原生后端
 在该会话中退出；有 guard 或状态不明时拒绝启动。打包后的最终产物需重新验证，
 installer 会阻止激活缺少有效收据的新启动器。详见 [兼容机制](COMPATIBILITY.md)。
+
+私有模式会拒绝清理本项目路径后仍存在的 `LD_PRELOAD` 或 `LD_AUDIT`，避免预加载库抢先
+占用 Mutter 的同名库。启动器保留发行版原始 `ExecStart` 和 wrapper 参数，但不能阻止
+任意 wrapper 在执行后重新设置加载环境。额外 wrapper（包括会注入库的远程桌面产品）
+必须在目标环境按实际命令与环境完成验证；当前默认 CI 不证明这些 wrapper 可用。
+不要通过 wrapper 重新注入变量来绕过启动检查。有隐私 guard 的启动尤其不能依赖未经验证的 wrapper。
 
 ## 实机验收
 
