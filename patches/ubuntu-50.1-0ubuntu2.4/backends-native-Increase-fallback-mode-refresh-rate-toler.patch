@@ -1,0 +1,33 @@
+From: Yella Ramya Krishna <ramya.krishna.yella@intel.com>
+Date: Tue, 11 Aug 2026 15:50:16 +0530
+Subject: backends/native: Increase fallback mode refresh rate tolerance to
+ 0.5 Hz
+
+The previous 0.1 Hz tolerance was too tight, causing most
+supported modes to be filtered out. Widen it to 0.5 Hz so that all
+supported fallback resolutions are listed.
+
+Closes: https://gitlab.gnome.org/GNOME/mutter/-/work_items/4956
+
+Signed-off-by: Yella Ramya Krishna <ramya.krishna.yella@intel.com>
+Part-of: <https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/5238>
+
+Origin: https://gitlab.gnome.org/GNOME/mutter/-/commit/92ff60c39ab9bd509017dfd4c82e60c7f13574af
+Bug-Ubuntu: https://bugs.launchpad.net/ubuntu/noble/+source/mutter/+bug/2163136
+---
+ src/backends/native/meta-output-kms.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/backends/native/meta-output-kms.c b/src/backends/native/meta-output-kms.c
+index 6253d42..49dd502 100644
+--- a/src/backends/native/meta-output-kms.c
++++ b/src/backends/native/meta-output-kms.c
+@@ -44,7 +44,7 @@
+ #include "backends/native/meta-kms-utils.h"
+ 
+ #define SYNC_TOLERANCE_HZ 0.001f
+-#define REFRESH_MATCH_TOLERANCE_HZ 0.1f
++#define REFRESH_MATCH_TOLERANCE_HZ 0.5f
+ 
+ struct _MetaOutputKms
+ {

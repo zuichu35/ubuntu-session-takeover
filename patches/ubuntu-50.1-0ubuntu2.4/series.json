@@ -1,0 +1,18 @@
+[
+  {
+    "file": "output-kms-Filter-fallback-modes-by-panel-supported-refre.patch",
+    "sha256": "1d6deae8dff38e54905405880b164ebc464ec80e92845c5f8bcc178dc99fe074"
+  },
+  {
+    "file": "backends-monitor-manager-Fix-auto-rotate-on-phones-without.patch",
+    "sha256": "e7738af6c34c804848b68ea14c68db7d19cba00dfbd0634bbba128ff9ea8bbe1"
+  },
+  {
+    "file": "tests-monitor-orientation-Add-auto-rotate-test-for-phones.patch",
+    "sha256": "f7f59678e180ae696deb1d3699494f70f1d395d1672ae0c6f444ddd9606dad96"
+  },
+  {
+    "file": "backends-native-Increase-fallback-mode-refresh-rate-toler.patch",
+    "sha256": "2d2cbf39af3367d6f8aade4ff32b6cf25442a652d2036e94e30b4428797261d1"
+  }
+]

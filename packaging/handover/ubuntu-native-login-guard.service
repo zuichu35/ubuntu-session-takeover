@@ -1,0 +1,10 @@
+[Unit]
+Description=Confirm native startup privacy after GNOME Shell is ready
+After=org.gnome.Shell@ubuntu.service graphical-session.target
+PartOf=graphical-session.target
+ConditionPathExists=/run/ubuntu-native-login/boot-guard
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/ubuntu-native-takeover-login-20261028/scripts/finish-login-guard.py
+TimeoutStartSec=50
+Restart=no

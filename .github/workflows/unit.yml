@@ -1,0 +1,28 @@
+name: Source tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 python3-gi build-essential pkg-config \
+            libglib2.0-dev libinput-dev libpam0g-dev
+      - name: Run tests with system Python 3.12
+        run: |
+          /usr/bin/python3 --version
+          /usr/bin/python3 scripts/test-unit.py

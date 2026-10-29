@@ -1,0 +1,15 @@
+vendor/
+build/
+dist/
+artifacts/
+research/
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.key
+*.pem
+credentials.ini
+.coverage
+.pytest_cache/

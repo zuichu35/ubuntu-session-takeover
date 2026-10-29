@@ -1,0 +1,326 @@
+--- a/mdk/mdk-context.c
++++ b/mdk/mdk-context.c
+@@ -497,7 +497,8 @@
+ {
+   g_autoptr (GError) error = NULL;
+ 
+-  if (!init_launch_environment (context, &error))
++  if (!g_getenv ("MDK_ATTACH_MONITOR") &&
++      !init_launch_environment (context, &error))
+     g_warning ("Failed to initialize launch environment: %s", error->message);
+ 
+   context->launchers =
+@@ -506,7 +507,8 @@
+   context->settings = g_settings_new ("org.gnome.mutter.devkit");
+   g_signal_connect (context->settings, "changed",
+                     G_CALLBACK (on_settings_changed), context);
+-  update_launchers (context);
++  if (!g_getenv ("MDK_ATTACH_MONITOR"))
++    update_launchers (context);
+ }
+ 
+ static void
+--- a/mdk/mdk-session.c
++++ b/mdk/mdk-session.c
+@@ -696,6 +696,9 @@
+ 
+   session->cancellable = g_cancellable_new ();
+ 
++  if (g_getenv ("MDK_ATTACH_MONITOR"))
++    return TRUE;
++
+   session->clipboard_changed_handler_id =
+     g_signal_connect (clipboard, "changed",
+                       G_CALLBACK (on_clipboard_changed),
+@@ -966,6 +969,22 @@
+   GVariantBuilder properties_builder;
+   g_autofree char *stream_path = NULL;
+ 
++  const char *connector = g_getenv ("MDK_ATTACH_MONITOR");
++
++  if (connector)
++    {
++      /* Attach to an existing output. Never create or resize an output here. */
++      g_variant_builder_init (&properties_builder, G_VARIANT_TYPE ("a{sv}"));
++      g_variant_builder_add (&properties_builder, "{sv}", "cursor-mode",
++                            g_variant_new_uint32 (MDK_SCREEN_CAST_CURSOR_MODE_METADATA));
++      if (!mdk_dbus_screen_cast_session_call_record_monitor_sync (
++            proxy, connector, g_variant_builder_end (&properties_builder),
++            &stream_path, NULL, error))
++        return NULL;
++      g_message ("Attached to existing monitor '%s'", connector);
++      return g_steal_pointer (&stream_path);
++    }
++
+   g_debug ("Creating virtual monitor");
+ 
+   g_variant_builder_init (&properties_builder, G_VARIANT_TYPE ("a{sv}"));
+--- a/mdk/mdk-monitor.c
++++ b/mdk/mdk-monitor.c
+@@ -899,13 +899,17 @@
+                            G_CALLBACK (on_emulate_touch_changed),
+                            monitor, 0);
+ 
+-  g_object_bind_property (G_OBJECT (context),
++  if (!g_getenv ("MDK_ATTACH_MONITOR"))
++    g_object_bind_property (G_OBJECT (context),
+                           "emulate-monitor-modes",
+                           G_OBJECT (monitor),
+                           "is-resizable",
+                           G_BINDING_SYNC_CREATE |
+                           G_BINDING_INVERT_BOOLEAN);
+ 
++  if (g_getenv ("MDK_ATTACH_MONITOR"))
++    g_object_set (monitor, "is-resizable", FALSE, NULL);
++
+   return monitor;
+ }
+ 
+--- a/mdk/mdk-main.c
++++ b/mdk/mdk-main.c
+@@ -93,6 +93,22 @@
+ }
+ 
+ static void
++leave_desktop (GSimpleAction *action, GVariant *parameter, gpointer data)
++{
++  g_application_quit (G_APPLICATION (data));
++}
++
++static void
++toggle_fullscreen (GSimpleAction *action, GVariant *parameter, gpointer data)
++{
++  GtkWindow *window = gtk_application_get_active_window (GTK_APPLICATION (data));
++  if (gtk_window_is_fullscreen (window))
++    gtk_window_unfullscreen (window);
++  else
++    gtk_window_fullscreen (window);
++}
++
++static void
+ activate_launch (GSimpleAction *action,
+                  GVariant      *parameter,
+                  gpointer       user_data)
+@@ -140,6 +156,9 @@
+   window = MDK_WINDOW (windows->data);
+ 
+   gtk_widget_set_visible (GTK_WIDGET (window), TRUE);
++
++  if (g_getenv ("MDK_ATTACH_FULLSCREEN"))
++    gtk_window_fullscreen (GTK_WINDOW (window));
+ 
+   monitor = mdk_monitor_new (context);
+   mdk_window_set_monitor (window, monitor);
+@@ -267,6 +286,8 @@
+   g_autoptr (MdkApplication) app = NULL;
+   static GActionEntry app_entries[] = {
+     { "about", activate_about, NULL, NULL, NULL },
++    { "leave", leave_desktop, NULL, NULL, NULL },
++    { "fullscreen", toggle_fullscreen, NULL, NULL, NULL },
+     { "toggle_emulate_touch", .state = "false", },
+     { "toggle_inhibit_system_shortcuts", .state = "false", },
+     { "toggle_host_keymap", .state = "false", },
+@@ -276,15 +297,54 @@
+     { "add_monitor", add_monitor, },
+   };
+ 
++  g_autofree char *attach_monitor = NULL;
++  g_autofree char *target_bus = NULL;
++  gboolean fullscreen = FALSE;
++  g_autoptr (GOptionContext) options = g_option_context_new ("- shared desktop local viewer");
++  g_autoptr (GError) option_error = NULL;
++  const GOptionEntry entries[] = {
++    { "attach-monitor", 0, 0, G_OPTION_ARG_STRING, &attach_monitor,
++      "Existing connector to view; required; does not start a desktop", "CONNECTOR" },
++    { "target-bus", 0, 0, G_OPTION_ARG_STRING, &target_bus,
++      "D-Bus address of the existing desktop; local DISPLAY stays unchanged", "ADDRESS" },
++    { "fullscreen", 0, 0, G_OPTION_ARG_NONE, &fullscreen,
++      "Open the local desktop fullscreen", NULL },
++    { NULL }
++  };
++
++  g_option_context_add_main_entries (options, entries, NULL);
++  if (!g_option_context_parse (options, &argc, &argv, &option_error))
++    {
++      g_printerr ("%s\n", option_error->message);
++      return EXIT_FAILURE;
++    }
++  if (!attach_monitor || !*attach_monitor)
++    {
++      g_printerr ("--attach-monitor CONNECTOR is required; refusing to create a new desktop.\n");
++      return EXIT_FAILURE;
++    }
++  g_setenv ("MDK_ATTACH_MONITOR", attach_monitor, TRUE);
++  if (fullscreen)
++    g_setenv ("MDK_ATTACH_FULLSCREEN", "1", TRUE);
++  if (target_bus)
++    g_setenv ("DBUS_SESSION_BUS_ADDRESS", target_bus, TRUE);
++
+   app = g_object_new (MDK_TYPE_APPLICATION,
+                       "application-id", "org.gnome.Mutter.Mdk",
+                       "flags", G_APPLICATION_NON_UNIQUE,
+                       NULL);
+   app->context = mdk_context_new ();
++  /* Attach viewer never launches applications or adds monitors to the target. */
+ 
+   g_action_map_add_action_entries (G_ACTION_MAP (app),
+                                    app_entries, G_N_ELEMENTS (app_entries),
+                                    app);
++
++  const char *disabled_actions[] = { "add_monitor", "launch", "edit_launchers",
++    "toggle_host_keymap", "toggle_emulate_monitor_modes", NULL };
++  for (int i = 0; disabled_actions[i]; i++)
++    g_simple_action_set_enabled (G_SIMPLE_ACTION (g_action_map_lookup_action (
++      G_ACTION_MAP (app), disabled_actions[i])), FALSE);
+ 
+   g_application_set_version (G_APPLICATION (app), VERSION);
+ 
+--- a/mdk/mdk-main-window.ui
++++ b/mdk/mdk-main-window.ui
+@@ -1,57 +1,24 @@
+ <?xml version="1.0" encoding="UTF-8"?>
+ <interface>
+   <menu id="header_menu">
++    <section id="launchers"/>
+     <section>
+-      <section>
+-        <submenu>
+-          <attribute name="label" translatable="yes">_Input</attribute>
+-          <item>
+-            <attribute name="label" translatable="yes">_Emulate touch</attribute>
+-            <attribute name="action">app.toggle_emulate_touch</attribute>
+-          </item>
+-          <item>
+-            <attribute name="label" translatable="yes">_Inhibit system shortcuts</attribute>
+-            <attribute name="action">app.toggle_inhibit_system_shortcuts</attribute>
+-          </item>
+-          <item>
+-            <attribute name="label" translatable="yes">Use host _keymap</attribute>
+-            <attribute name="action">app.toggle_host_keymap</attribute>
+-          </item>
+-        </submenu>
+-      </section>
+-      <section>
+-        <submenu>
+-          <attribute name="label" translatable="yes">_Monitors</attribute>
+-          <item>
+-            <attribute name="label" translatable="yes">_Add monitor</attribute>
+-            <attribute name="action">app.add_monitor</attribute>
+-          </item>
+-          <item>
+-            <attribute name="label" translatable="yes">_Emulate monitor modes</attribute>
+-            <attribute name="action">app.toggle_emulate_monitor_modes</attribute>
+-          </item>
+-        </submenu>
+-      </section>
+-      <section>
+-        <submenu>
+-          <attribute name="label" translatable="yes">_Launchers</attribute>
+-          <section id="launchers"/>
+-          <section>
+-            <item>
+-              <attribute name="label" translatable="yes">_Edit launchers</attribute>
+-              <attribute name="action">app.edit_launchers</attribute>
+-            </item>
+-          </section>
+-        </submenu>
+-      </section>
+       <item>
+-        <attribute name="label" translatable="yes">_About Mutter Development Kit</attribute>
+-        <attribute name="action">app.about</attribute>
++        <attribute name="label">切换全屏</attribute>
++        <attribute name="action">app.fullscreen</attribute>
++      </item>
++      <item>
++        <attribute name="label">将系统快捷键发送到共享桌面</attribute>
++        <attribute name="action">app.toggle_inhibit_system_shortcuts</attribute>
++      </item>
++      <item>
++        <attribute name="label">返回本机桌面（保留工作）</attribute>
++        <attribute name="action">app.leave</attribute>
+       </item>
+     </section>
+   </menu>
+   <template class="MdkMainWindow" parent="MdkWindow">
+-    <property name="title" translatable="yes">Mutter Development Kit</property>
++    <property name="title" translatable="yes">共享工作桌面</property>
+     <child type="titlebar">
+       <object class="GtkHeaderBar" id="headerbar">
+         <child type="end">
+--- a/mdk/mdk-stream.c
++++ b/mdk/mdk-stream.c
+@@ -943,6 +943,8 @@
+ read_metadata:
+   read_cursor_metadata (stream, spa_buffer);
+ 
++  if (stream->frame_sequence == 0 && g_getenv ("MDK_ATTACH_MONITOR"))
++    g_message ("[Takeover] First local frame received");
+   stream->frame_sequence++;
+   stream->process_requested = FALSE;
+ 
+@@ -1197,6 +1199,14 @@
+ }
+ 
+ static gboolean
++stream_setup_timed_out (gpointer user_data)
++{
++  gboolean *timed_out = user_data;
++  *timed_out = TRUE;
++  return G_SOURCE_REMOVE;
++}
++
++static gboolean
+ init_pipewire_stream (MdkStream  *stream,
+                       GError    **error)
+ {
+@@ -1206,6 +1216,10 @@
+   g_autoptr (MdkMonitorInfo) monitor_info = NULL;
+   g_autofree char *stream_path = NULL;
+   gboolean ret = FALSE;
++  gboolean timed_out = FALSE;
++  g_autoptr (GSource) timeout_source = g_timeout_source_new_seconds (20);
++  g_source_set_callback (timeout_source, stream_setup_timed_out, &timed_out, NULL);
++  g_source_attach (timeout_source, stream->main_context);
+   /* Set preferred size to 60% of a FHD resolution. */
+   const double max_logical_size = (1920 * 1080 * 0.6);
+ 
+@@ -1350,13 +1364,20 @@
+                                                     error))
+     goto err;
+ 
+-  while (!stream->node_id)
++  while (!stream->node_id && !timed_out)
+     g_main_context_iteration (stream->main_context, TRUE);
++
++  if (timed_out)
++    {
++      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
++                           "Timed out waiting for PipeWire node");
++      goto err;
++    }
+ 
+   if (!connect_to_stream (stream, error))
+     goto err;
+ 
+-  while (stream->format.info.raw.size.width == 0 &&
++  while (!timed_out && stream->format.info.raw.size.width == 0 &&
+          pw_stream_get_state (stream->pipewire_stream, NULL) !=
+          PW_STREAM_STATE_ERROR)
+     g_main_context_iteration (stream->main_context, TRUE);
+@@ -1369,9 +1390,16 @@
+       goto err;
+     }
+ 
++  if (timed_out)
++    {
++      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
++                           "Timed out negotiating PipeWire format");
++      goto err;
++    }
+   ret = TRUE;
+ 
+ err:
++  g_source_destroy (timeout_source);
+   mdk_pipewire_pop_main_context (pipewire, stream->main_context);
+   g_main_context_pop_thread_default (stream->main_context);
+ 

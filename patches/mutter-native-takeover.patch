@@ -1,0 +1,2598 @@
+--- a/src/backends/native/meta-output-kms.c
++++ b/src/backends/native/meta-output-kms.c
+@@ -44,6 +44,7 @@
+ #include "backends/native/meta-kms-utils.h"
+ 
+ #define SYNC_TOLERANCE_HZ 0.001f
++#define REFRESH_MATCH_TOLERANCE_HZ 0.5f
+ 
+ struct _MetaOutputKms
+ {
+@@ -181,6 +182,7 @@
+       const drmModeModeInfo *drm_mode;
+       float refresh_rate;
+       gboolean is_duplicate = FALSE;
++      gboolean has_matching_refresh_rate = FALSE;
+ 
+       if (!(meta_kms_mode_get_flags (fallback_mode) & flag_filter))
+         continue;
+@@ -206,8 +208,14 @@
+               is_duplicate = TRUE;
+               break;
+             }
+-        }
+-      if (is_duplicate)
++
++          if (!has_matching_refresh_rate &&
++              fabs (refresh_rate - crtc_mode_info->refresh_rate) <
++              REFRESH_MATCH_TOLERANCE_HZ)
++            has_matching_refresh_rate = TRUE;
++        }
++
++      if (is_duplicate || !has_matching_refresh_rate)
+         continue;
+ 
+       crtc_mode = meta_gpu_kms_get_mode_from_kms_mode (gpu_kms,
+--- a/src/backends/meta-monitor-manager.c
++++ b/src/backends/meta-monitor-manager.c
+@@ -39,6 +39,7 @@
+  */
+ 
+ #include "config.h"
++#include "backends/meta-native-privacy.h"
+ 
+ #include "backends/meta-monitor-manager-private.h"
+ 
+@@ -123,6 +124,7 @@
+   uint32_t backlight_serial;
+ 
+   gboolean power_save_inhibit_orientation_tracking;
++  gboolean orientation_unmanaged_inhibited;
+ } MetaMonitorManagerPrivate;
+ 
+ G_DEFINE_TYPE_WITH_PRIVATE (MetaMonitorManager, meta_monitor_manager,
+@@ -979,24 +981,50 @@
+   return TRUE;
+ }
+ 
+-static void
+-orientation_changed (MetaMonitorManager *manager)
++/*
++ * Inhibit orientation tracking only when the panel orientation is unmanaged
++ * and the initial orientation has already been read. Before the initial read
++ * the sensor must be claimable so handle_initial_orientation_change() can run.
++ */
++static void
++sync_orientation_unmanaged_inhibit (MetaMonitorManager *manager)
+ {
+   MetaMonitorManagerPrivate *priv =
+     meta_monitor_manager_get_instance_private (manager);
+   MetaOrientationManager *orientation_manager =
+     meta_backend_get_orientation_manager (manager->backend);
++  gboolean should_inhibit;
++
++  should_inhibit = !manager->panel_orientation_managed &&
++                   priv->initial_orient_change_done;
++
++  if (priv->orientation_unmanaged_inhibited == should_inhibit)
++    return;
++
++  priv->orientation_unmanaged_inhibited = should_inhibit;
++
++  if (should_inhibit)
++    meta_orientation_manager_inhibit_tracking (orientation_manager);
++  else
++    meta_orientation_manager_uninhibit_tracking (orientation_manager);
++}
++
++static void
++orientation_changed (MetaMonitorManager *manager)
++{
++  MetaMonitorManagerPrivate *priv =
++    meta_monitor_manager_get_instance_private (manager);
++  MetaOrientationManager *orientation_manager =
++    meta_backend_get_orientation_manager (manager->backend);
+ 
+   if (!priv->initial_orient_change_done)
+     {
+       priv->initial_orient_change_done = TRUE;
++
++      sync_orientation_unmanaged_inhibit (manager);
++
+       if (handle_initial_orientation_change (orientation_manager, manager))
+-        {
+-          meta_orientation_manager_inhibit_tracking (orientation_manager);
+-          return;
+-        }
+-
+-      meta_orientation_manager_inhibit_tracking (orientation_manager);
++        return;
+     }
+ 
+   if (!manager->panel_orientation_managed)
+@@ -1120,23 +1148,18 @@
+   meta_dbus_display_config_set_panel_orientation_managed (manager->display_config,
+                                                           manager->panel_orientation_managed);
+ 
+-  if (panel_orientation_managed)
+-    {
+-      meta_orientation_manager_uninhibit_tracking (orientation_manager);
+-
+-      /* Claiming the sensor is asynchronous. We listen to
+-       * MetaOrientationManager::sensor-active to rotate to the current orientation
+-       * once the sensor is claimed.
+-       */
+-    }
+-  else
++  sync_orientation_unmanaged_inhibit (manager);
++
++  /* When transitioning to managed, claiming the sensor is asynchronous; we
++   * listen to MetaOrientationManager::sensor-active to rotate to the current
++   * orientation once it's claimed. When transitioning to unmanaged, rotate
++   * back to a normal transform.
++   */
++  if (!panel_orientation_managed)
+     {
+       MetaMonitorsConfig *current_config =
+         meta_monitor_config_manager_get_current (manager->config_manager);
+ 
+-      meta_orientation_manager_inhibit_tracking (orientation_manager);
+-
+-      /* Rotate back to normal transform when orientation goes unmanaged */
+       if (current_config)
+         {
+           g_autoptr (MetaMonitorsConfig) config = NULL;
+@@ -2306,6 +2329,27 @@
+   g_variant_builder_init (&properties_builder, G_VARIANT_TYPE ("a{sv}"));
+   capabilities = meta_monitor_manager_get_capabilities (manager);
+ 
++  if (g_getenv ("MUTTER_NATIVE_TAKEOVER"))
++    {
++      MetaMonitorsConfig *current =
++        meta_monitor_config_manager_get_current (manager->config_manager);
++      g_variant_builder_add (&properties_builder, "{sv}",
++                             "native-takeover-viewport-supported",
++                             g_variant_new_boolean (TRUE));
++      g_variant_builder_add (&properties_builder, "{sv}",
++                             "native-takeover-scale-supported",
++                             g_variant_new_boolean (TRUE));
++      if (current && current->logical_monitor_configs)
++        {
++          MetaLogicalMonitorConfig *logical = current->logical_monitor_configs->data;
++          if (logical->native_takeover_viewport)
++            g_variant_builder_add (&properties_builder, "{sv}",
++                                   "native-takeover-size",
++                                   g_variant_new ("(uu)", logical->native_viewport_width,
++                                                  logical->native_viewport_height));
++        }
++    }
++
+   g_variant_builder_add (&properties_builder, "{sv}",
+                          "layout-mode",
+                          g_variant_new_uint32 (manager->layout_mode));
+@@ -2462,7 +2506,8 @@
+               return FALSE;
+             }
+ 
+-          if (!meta_monitor_manager_is_scale_supported_for_config (manager,
++          if (!logical_monitor_config->native_takeover_viewport &&
++              !meta_monitor_manager_is_scale_supported_for_config (manager,
+                                                                    config,
+                                                                    monitor,
+                                                                    monitor_mode,
+@@ -2721,6 +2766,7 @@
+ create_logical_monitor_config_from_variant (MetaMonitorManager          *manager,
+                                             GVariant                    *logical_monitor_config_variant,
+                                             MetaLogicalMonitorLayoutMode layout_mode,
++                                            GVariant                    *native_size,
+                                             GError                     **error)
+ {
+   MetaLogicalMonitorConfig *logical_monitor_config;
+@@ -2741,6 +2787,12 @@
+                  &is_primary,
+                  &monitor_configs_iter);
+   scale = (float) scale_d;
++  if (native_size && (!isfinite (scale) || scale < 1.0f || scale > 2.0f))
++    {
++      g_variant_iter_free (monitor_configs_iter);
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Invalid remote scale");
++      goto err;
++    }
+ 
+   while (TRUE)
+     {
+@@ -2777,7 +2829,7 @@
+     }
+ 
+   first_monitor_config = monitor_configs->data;
+-  if (!find_monitor_mode_scale (manager,
++  if (!native_size && !find_monitor_mode_scale (manager,
+                                 layout_mode,
+                                 first_monitor_config,
+                                 scale,
+@@ -2803,6 +2855,24 @@
+     .monitor_configs = monitor_configs
+   };
+ 
++  if (native_size)
++    {
++      guint32 remote_width, remote_height;
++      g_variant_get (native_size, "(uu)", &remote_width, &remote_height);
++      if (remote_width < 200 || remote_width > 8192 ||
++          remote_height < 200 || remote_height > 8192)
++        {
++          meta_logical_monitor_config_free (logical_monitor_config);
++          g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Invalid remote scale");
++          return NULL;
++        }
++      logical_monitor_config->native_viewport_width = remote_width;
++      logical_monitor_config->native_viewport_height = remote_height;
++      logical_monitor_config->layout.width = (int) ceilf (remote_width / scale);
++      logical_monitor_config->layout.height = (int) ceilf (remote_height / scale);
++      logical_monitor_config->native_takeover_viewport = TRUE;
++    }
++
+   if (!meta_verify_logical_monitor_config (logical_monitor_config,
+                                            layout_mode,
+                                            manager,
+@@ -2913,6 +2983,7 @@
+   const MetaMonitorConfigPolicy *policy;
+   MetaMonitorManagerCapability capabilities;
+   g_autoptr (GVariant) layout_mode_variant = NULL;
++  g_autoptr (GVariant) native_size = NULL;
+   MetaLogicalMonitorLayoutMode layout_mode;
+   GVariantIter logical_monitor_configs_iter;
+   g_autoptr (MetaMonitorsConfig) config = NULL;
+@@ -2974,6 +3045,21 @@
+       return G_DBUS_METHOD_INVOCATION_HANDLED;
+     }
+ 
++  native_size = g_variant_lookup_value (properties_variant,
++                                        "native-takeover-size", NULL);
++  if (native_size &&
++      (!g_variant_is_of_type (native_size, G_VARIANT_TYPE ("(uu)")) ||
++       !meta_native_privacy_has_lease () ||
++       (method != META_MONITORS_CONFIG_METHOD_VERIFY &&
++        method != META_MONITORS_CONFIG_METHOD_TEMPORARY) ||
++       g_variant_n_children (logical_monitor_configs_variant) != 1))
++    {
++      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
++                                             G_DBUS_ERROR_INVALID_ARGS,
++                                             "Native viewport requires one protected temporary desktop");
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
+   g_variant_iter_init (&logical_monitor_configs_iter,
+                        logical_monitor_configs_variant);
+   while (TRUE)
+@@ -2989,6 +3075,7 @@
+         create_logical_monitor_config_from_variant (manager,
+                                                     logical_monitor_config_variant,
+                                                     layout_mode,
++                                                    native_size,
+                                                     &error);
+       g_variant_unref (logical_monitor_config_variant);
+ 
+--- a/src/tests/meson.build
++++ b/src/tests/meson.build
+@@ -339,6 +339,17 @@
+     'suite': 'backend',
+     'sources': [
+       'monitor-orientation-tests.c',
++      monitor_tests_common,
++    ],
++    'depends': [
++      monitor_tests_common_deps,
++    ],
++  },
++  {
++    'name': 'monitor-orientation-phone-tests',
++    'suite': 'backend',
++    'sources': [
++      'monitor-orientation-phone-tests.c',
+       monitor_tests_common,
+     ],
+     'depends': [
+--- /dev/null
++++ b/src/tests/monitor-orientation-phone-tests.c
+@@ -0,0 +1,293 @@
++/*
++ * Copyright (C) 2016-2025 Red Hat, Inc.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include "config.h"
++
++#include "backends/meta-monitor-config-manager.h"
++#include "tests/meta-backend-test.h"
++#include "tests/meta-sensors-proxy-mock.h"
++#include "tests/monitor-tests-common.h"
++
++typedef ClutterVirtualInputDevice ClutterAutoRemoveInputDevice;
++static void
++input_device_test_remove (ClutterAutoRemoveInputDevice *virtual_device)
++{
++  MetaBackend *backend = meta_context_get_backend (test_context);
++
++  meta_backend_test_remove_test_device (META_BACKEND_TEST (backend),
++                                        virtual_device);
++  g_object_unref (virtual_device);
++}
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (ClutterAutoRemoveInputDevice,
++                               input_device_test_remove)
++
++typedef MetaSensorsProxyMock MetaSensorsProxyAutoResetMock;
++static void
++meta_sensors_proxy_confirm_released (MetaSensorsProxyMock *proxy)
++{
++  MetaBackend *backend = meta_context_get_backend (test_context);
++  MetaOrientationManager *orientation_manager =
++    meta_backend_get_orientation_manager (backend);
++
++  g_object_unref (proxy);
++
++  g_test_message ("Confirming accelerometer released");
++  while (meta_orientation_manager_get_orientation (orientation_manager) != META_ORIENTATION_UNDEFINED)
++    g_main_context_iteration (NULL, TRUE);
++}
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (MetaSensorsProxyAutoResetMock,
++                               meta_sensors_proxy_confirm_released)
++
++static void
++on_signal (gboolean *signal_received)
++{
++  *signal_received = TRUE;
++}
++
++static void
++check_monitor_configuration_per_orientation (MonitorTestCase *test_case,
++                                             unsigned int     monitor_index,
++                                             MetaOrientation  orientation,
++                                             int              width,
++                                             int              height)
++{
++  MtkMonitorTransform transform;
++  MtkMonitorTransform output_transform;
++  MonitorTestCaseExpect expect = test_case->expect;
++  MonitorTestCaseSetup *setup = &test_case->setup;
++  int i = 0;
++
++  transform = meta_orientation_to_transform (orientation);
++  output_transform = setup->outputs[monitor_index].panel_orientation_transform;
++  expect.logical_monitors[monitor_index].transform =
++    mtk_monitor_transform_transform (transform,
++                                     mtk_monitor_transform_invert (output_transform));
++  expect.crtcs[monitor_index].transform = transform;
++
++  if (mtk_monitor_transform_is_rotated (transform))
++    {
++      expect.logical_monitors[monitor_index].layout.width = height;
++      expect.logical_monitors[monitor_index].layout.height = width;
++    }
++  else
++    {
++      expect.logical_monitors[monitor_index].layout.width = width;
++      expect.logical_monitors[monitor_index].layout.height = height;
++    }
++
++  expect.screen_width = 0;
++  expect.screen_height = 0;
++
++  for (i = 0; i < expect.n_logical_monitors; ++i)
++    {
++      MonitorTestCaseLogicalMonitor *monitor =
++        &expect.logical_monitors[i];
++      int right_edge;
++      int bottom_edge;
++
++      g_debug ("Got monitor %dx%d : %dx%d", monitor->layout.x,
++               monitor->layout.y, monitor->layout.width,
++               monitor->layout.height);
++
++      right_edge = (monitor->layout.width + monitor->layout.x);
++      if (right_edge > expect.screen_width)
++        expect.screen_width = right_edge;
++
++      bottom_edge = (monitor->layout.height + monitor->layout.y);
++      if (bottom_edge > expect.screen_height)
++        expect.screen_height = bottom_edge;
++    }
++
++  meta_check_monitor_configuration (test_context,
++                                    &expect);
++  meta_check_monitor_test_clients_state ();
++}
++
++static void
++meta_test_monitor_orientation_phone (void)
++{
++  MonitorTestCase test_case = {
++    .setup = {
++      .modes = {
++        {
++          .width = 1080,
++          .height = 1920,
++          .refresh_rate = 60.000495910644531
++        }
++      },
++      .n_modes = 1,
++      .outputs = {
++        {
++          .crtc = 0,
++          .modes = { 0 },
++          .n_modes = 1,
++          .preferred_mode = 0,
++          .possible_crtcs = { 0 },
++          .n_possible_crtcs = 1,
++          .width_mm = 125,
++          .height_mm = 222,
++          .connector_type = META_CONNECTOR_TYPE_eDP,
++          .serial = "0x123456",
++        },
++      },
++      .n_outputs = 1,
++      .crtcs = {
++        {
++          .current_mode = 0
++        },
++      },
++      .n_crtcs = 1
++    },
++
++    .expect = {
++      .monitors = {
++        {
++          .outputs = { 0 },
++          .n_outputs = 1,
++          .modes = {
++            {
++              .width = 1080,
++              .height = 1920,
++              .refresh_rate = 60.000495910644531,
++              .crtc_modes = {
++                {
++                  .output = 0,
++                  .crtc_mode = 0
++                }
++              }
++            }
++          },
++          .n_modes = 1,
++          .current_mode = 0,
++          .width_mm = 125,
++          .height_mm = 222,
++        }
++      },
++      .n_monitors = 1,
++      .logical_monitors = {
++        {
++          .monitors = { 0 },
++          .n_monitors = 1,
++          .layout = { .x = 0, .y = 0, .width = 1080, .height = 1920 },
++          .scale = 1
++        }
++      },
++      .n_logical_monitors = 1,
++      .primary_logical_monitor = 0,
++      .n_outputs = 1,
++      .crtcs = {
++        {
++          .current_mode = 0,
++        }
++      },
++      .n_crtcs = 1,
++      .n_tiled_monitors = 0,
++      .screen_width = 1080,
++      .screen_height = 1920
++    }
++  };
++  MetaMonitorTestSetup *test_setup;
++  MetaBackend *backend = meta_context_get_backend (test_context);
++  g_autoptr (MetaSensorsProxyAutoResetMock) orientation_mock = NULL;
++  g_autoptr (ClutterAutoRemoveInputDevice) touch_device = NULL;
++  ClutterBackend *clutter_backend = meta_backend_get_clutter_backend (backend);
++  ClutterSeat *seat = clutter_backend_get_default_seat (clutter_backend);
++  MetaMonitorManager *monitor_manager =
++    meta_backend_get_monitor_manager (backend);
++  MetaOrientationManager *orientation_manager =
++    meta_backend_get_orientation_manager (backend);
++  unsigned int n_orientation_changed = 0;
++
++  g_test_message ("%s", G_STRFUNC);
++
++  /* A phone: a portrait builtin panel and a touchscreen, but no pointer
++   * device and no tablet mode switch, so touch mode is enabled.
++   */
++  touch_device =
++    meta_backend_test_add_test_device (META_BACKEND_TEST (backend),
++                                       CLUTTER_TOUCHSCREEN_DEVICE, 1);
++
++  test_setup = meta_create_monitor_test_setup (backend,
++                                               &test_case.setup,
++                                               MONITOR_TEST_FLAG_NO_STORED);
++  meta_emulate_hotplug (test_setup);
++
++  g_assert_true (clutter_seat_get_touch_mode (seat));
++
++  /* Make the sensor proxy report an accelerometer already when mutter's
++   * proxy fetches its initial property cache, like iio-sensor-proxy does
++   * when it starts before mutter: the property is set before the main
++   * context is iterated, so panel orientation management gets enabled
++   * before the first accelerometer claim attempt.
++   */
++  orientation_mock = meta_sensors_proxy_mock_get ();
++  meta_sensors_proxy_mock_set_property (orientation_mock, "HasAccelerometer",
++                                        g_variant_new_boolean (TRUE));
++
++  while (!meta_orientation_manager_has_accelerometer (orientation_manager))
++    g_main_context_iteration (NULL, TRUE);
++
++  g_assert_true (
++    meta_monitor_manager_get_panel_orientation_managed (monitor_manager));
++
++  meta_sensors_proxy_mock_wait_accelerometer_claimed (orientation_mock, TRUE);
++
++  g_signal_connect_swapped (orientation_manager, "orientation-changed",
++                            G_CALLBACK (on_signal),
++                            &n_orientation_changed);
++
++  meta_sensors_proxy_mock_set_orientation (orientation_mock,
++                                           META_ORIENTATION_RIGHT_UP);
++  while (n_orientation_changed != 1)
++    g_main_context_iteration (NULL, TRUE);
++
++  META_TEST_LOG_CALL ("Checking configuration per orientation",
++                      check_monitor_configuration_per_orientation (
++                        &test_case, 0, META_ORIENTATION_RIGHT_UP,
++                        1080, 1920));
++
++  /* Unlike on unmanaged panels, later orientation changes must keep
++   * rotating the panel.
++   */
++  n_orientation_changed = 0;
++  meta_sensors_proxy_mock_set_orientation (orientation_mock,
++                                           META_ORIENTATION_NORMAL);
++  while (n_orientation_changed != 1)
++    g_main_context_iteration (NULL, TRUE);
++
++  META_TEST_LOG_CALL ("Checking configuration per orientation",
++                      check_monitor_configuration_per_orientation (
++                        &test_case, 0, META_ORIENTATION_NORMAL,
++                        1080, 1920));
++
++  g_signal_handlers_disconnect_by_data (orientation_manager,
++                                        &n_orientation_changed);
++}
++
++static void
++init_orientation_phone_tests (void)
++{
++  meta_add_monitor_test ("/backends/monitor/orientation/phone",
++                         meta_test_monitor_orientation_phone);
++}
++
++int
++main (int   argc,
++      char *argv[])
++{
++  return meta_monitor_test_main (argc, argv, init_orientation_phone_tests);
++}
+--- /dev/null
++++ b/src/backends/meta-native-privacy.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#pragma once
++#include "meta/meta-context.h"
++#include "clutter/clutter.h"
++struct libinput_event;
++struct _MetaLogicalMonitor;
++gboolean meta_native_privacy_get_viewport_size (struct _MetaLogicalMonitor *monitor,
++                                                int *width, int *height);
++void meta_native_privacy_init (MetaContext *context);
++gboolean meta_native_privacy_active (void);
++gboolean meta_native_privacy_has_lease (void);
++gboolean meta_native_privacy_filter_input (struct libinput_event *event);
++void meta_native_privacy_painted (ClutterStageView *view, ClutterFrame *frame);
++void meta_native_privacy_paint_local (ClutterStageView *view);
++
++guint meta_native_privacy_key_count (guint key, guint fallback);
++gboolean meta_native_privacy_is_cleanup_event (const ClutterEvent *event);
+--- /dev/null
++++ b/src/backends/meta-native-privacy.c
+@@ -0,0 +1,1270 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later
++ * Native seat privacy for an authenticated RDP lease. The actual GNOME session
++ * retains its DRM, libinput and Wayland clients throughout the handover.
++ * Screen capture paints offscreen; only physical stage views are blackened.
++ */
++#include "config.h"
++#include "backends/meta-native-privacy.h"
++#include "backends/meta-native-local-lock.h"
++#include "backends/meta-backend-private.h"
++#include "backends/meta-monitor-config-manager.h"
++#include "backends/meta-monitor-manager-private.h"
++#include "clutter/clutter-mutter.h"
++#include "meta/compositor.h"
++#include "meta/meta-remote-access-controller.h"
++#include <libinput.h>
++#include <linux/input-event-codes.h>
++#include <unistd.h>
++#include <pwd.h>
++#include <grp.h>
++#include <gmodule.h>
++#include <cairo.h>
++#include "backends/native/meta-seat-native.h"
++#include "backends/native/meta-input-thread.h"
++#include "backends/native/meta-input-device-native.h"
++#include "clutter/clutter-event-private.h"
++#include "clutter/clutter-stage-private.h"
++
++static MetaContext *privacy_context;
++static GDBusConnection *privacy_bus;
++static GDBusConnection *system_bus;
++static GDBusMethodInvocation *begin_call;
++static char *owner;
++static char *session_path;
++static guint owner_watch;
++static guint timeout_id;
++static GHashTable *painted_views;
++static GHashTable *presented_views;
++static gint active;
++static gint startup_guard = -1;
++static gboolean greeter_mode, greeter_shell_uninhibited, startup_guard_ready;
++static gboolean startup_failed, startup_local_ui, local_authenticated;
++static gint64 startup_started, reclaim_started, last_unlock_request;
++static gint64 startup_timeout_us = 30 * G_USEC_PER_SEC;
++static gint64 reclaim_timeout_us = 10 * G_USEC_PER_SEC;
++static guint lock_epoch, lock_retries;
++static GCancellable *lock_cancel;
++static gboolean saver_known, saver_active, hint_known, hint_locked;
++static const char *lock_reason = "idle";
++static char *greeter_session_path;
++static gint enabled;
++static gboolean locking;
++static gboolean remote_inhibited;
++static gboolean lock_poll_pending;
++static gboolean lock_request_pending;
++static gint64 last_lock_request;
++static gboolean unlock_pending;
++static gboolean unlock_requested;
++static gboolean test_mode;
++static gboolean reclaiming;
++static gint lease_generation;
++static GMutex input_mutex;
++static guint physical_keys[KEY_CNT];
++typedef struct {
++  ClutterInputDevice *test_device; /* Only populated in headless fault-injection tests. */
++  gboolean keys[KEY_CNT];
++  gboolean blocked_keys[KEY_CNT];
++  gboolean auth_keys[KEY_CNT];
++  enum libinput_event_type delivered_keys[KEY_CNT];
++  GHashTable *touch_slots;
++  gboolean blocked_touch, blocked_tip, blocked_gesture;
++  gboolean delivered_tip;
++  enum libinput_event_type delivered_gesture;
++  guint gesture_fingers;
++  guint contacts;
++  gboolean tip;
++  gboolean gesture;
++} PhysicalDevice;
++static GHashTable *physical_devices;
++static guint physical_down;
++static gboolean input_reset_pending;
++
++static const char xml[] =
++  "<node><interface name='org.gnome.Mutter.NativeTakeover'>"
++  "<method name='Begin'><arg name='session' type='o' direction='in'/></method>"
++  "<method name='End'/><method name='GetState'>"
++  "<arg type='s' direction='out'/></method>"
++  "<method name='GetStatus'><arg type='a{sv}' direction='out'/></method>"
++  "<method name='InspectPhysical'><arg type='u' direction='out'/>"
++  "<arg type='b' direction='out'/></method>"
++  "<method name='PrepareLogin'><arg type='o' direction='in'/></method>"
++  "<method name='TestHoldInput'/>"
++  "<method name='TestLocalKey'><arg type='u' direction='in'/><arg type='b' direction='in'/></method>"
++  "<method name='TestInputState'><arg type='u' direction='out'/><arg type='u' direction='out'/><arg type='b' direction='out'/></method>"
++  "<signal name='Revoked'/></interface></node>";
++
++static MetaBackend * backend (void) { return meta_context_get_backend (privacy_context); }
++static ClutterStage * stage (void) { return CLUTTER_STAGE (meta_backend_get_stage (backend ())); }
++static MetaRemoteAccessController * controller (void)
++{ return meta_backend_get_remote_access_controller (backend ()); }
++static MetaCompositor * compositor (void)
++{ return meta_display_get_compositor (meta_context_get_display (privacy_context)); }
++
++static gboolean
++startup_privacy_active (void)
++{
++  if (g_atomic_int_get (&startup_guard) < 0)
++    g_atomic_int_compare_and_exchange (&startup_guard, -1,
++      g_strcmp0 (g_getenv ("MUTTER_NATIVE_TAKEOVER"), "1") == 0 &&
++      g_strcmp0 (g_getenv ("MUTTER_NATIVE_BOOT_PRIVACY"), "1") == 0);
++  return g_atomic_int_get (&startup_guard);
++}
++
++gboolean meta_native_privacy_has_lease (void)
++{ return g_atomic_int_get (&active) && !locking; }
++
++gboolean meta_native_privacy_active (void)
++/* Begin sets active before clearing startup_guard: read in reverse order
++ * so the input thread cannot observe a gap while ownership is transferred. */
++{ return startup_privacy_active () || g_atomic_int_get (&active); }
++
++gboolean
++meta_native_privacy_get_viewport_size (MetaLogicalMonitor *monitor,
++                                       int *width, int *height)
++{
++  if (!privacy_context || !meta_native_privacy_active ()) return FALSE;
++  MetaMonitorManager *manager = meta_backend_get_monitor_manager (backend ());
++  if (monitor != meta_monitor_manager_get_primary_logical_monitor (manager)) return FALSE;
++  MetaMonitorsConfig *config = meta_monitor_config_manager_get_current (
++    meta_monitor_manager_get_config_manager (manager));
++  if (!config || !config->logical_monitor_configs) return FALSE;
++  MetaLogicalMonitorConfig *logical = config->logical_monitor_configs->data;
++  if (!logical->native_takeover_viewport) return FALSE;
++  *width = logical->native_viewport_width;
++  *height = logical->native_viewport_height;
++  return TRUE;
++}
++
++static const char * state (void)
++{
++  if (startup_privacy_active ())
++    {
++      if (startup_failed) return "startup-failed";
++      if (locking || unlock_pending) return "startup-locking";
++      return startup_guard_ready ? "ready-guarded" : "boot-guard";
++    }
++  if (locking) return "locking";
++  if (begin_call) return "blanking";
++  return meta_native_privacy_active () ? "remote" : "local";
++}
++
++static void start_lock (void);
++static void unlock_reply (GObject *source, GAsyncResult *result, gpointer data);
++
++typedef struct { guint key; gboolean down; gint generation; } LocalKey;
++
++static gboolean
++deliver_local_key (gpointer data)
++{
++  LocalKey *event = data;
++  if (greeter_mode && event->key == KEY_ESC && event->down &&
++      meta_native_privacy_active () && !locking && !begin_call)
++    { start_lock (); return G_SOURCE_REMOVE; }
++  if (event->generation == g_atomic_int_get (&lease_generation) &&
++      meta_native_privacy_active () && (!locking || startup_local_ui) &&
++      !begin_call && !reclaiming)
++    meta_native_local_lock_key (event->key, event->down, TRUE);
++  return G_SOURCE_REMOVE;
++}
++
++static void
++queue_local_key (guint key, gboolean down)
++{
++  LocalKey *event = g_new0 (LocalKey, 1);
++  event->key = key; event->down = down;
++  event->generation = g_atomic_int_get (&lease_generation);
++  g_idle_add_full (G_PRIORITY_DEFAULT, deliver_local_key, event, g_free);
++}
++
++static void local_verified (void);
++
++void
++meta_native_privacy_paint_local (ClutterStageView *view)
++{
++  if (meta_native_privacy_active () && (!locking || startup_local_ui || reclaiming) && !begin_call)
++    meta_native_local_lock_paint (view);
++}
++
++/* This runs in the libinput thread BEFORE modifier state, repeat, keybindings,
++ * accessibility, or application dispatch. EI virtual input does not enter it.
++ * Track physical and delivered state separately. A held physical input never
++ * blocks a lease; old presses are quarantined individually until released.
++ */
++static void
++physical_device_free (PhysicalDevice *device)
++{
++  g_clear_pointer (&device->touch_slots, g_hash_table_unref);
++  g_clear_object (&device->test_device);
++  g_free (device);
++}
++
++guint
++meta_native_privacy_key_count (guint key, guint fallback)
++{
++  GHashTableIter iter;
++  gpointer value;
++  guint count = 0;
++  if (!g_atomic_int_get (&enabled)) return fallback;
++  g_mutex_lock (&input_mutex);
++  if (physical_devices)
++    {
++      g_hash_table_iter_init (&iter, physical_devices);
++      while (g_hash_table_iter_next (&iter, NULL, &value))
++        count += ((PhysicalDevice *) value)->delivered_keys[key] != 0;
++    }
++  g_mutex_unlock (&input_mutex);
++  return count;
++}
++
++gboolean
++meta_native_privacy_filter_input (struct libinput_event *event)
++{
++  enum libinput_event_type type;
++  gboolean drop, down = FALSE, remote;
++  guint key = KEY_CNT;
++  PhysicalDevice *device;
++  struct libinput_device *input_device;
++  if (!g_atomic_int_get (&enabled)) return FALSE;
++  type = libinput_event_get_type (event);
++  g_mutex_lock (&input_mutex);
++  input_device = libinput_event_get_device (event);
++  if (!physical_devices)
++    physical_devices = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, (GDestroyNotify) physical_device_free);
++  device = g_hash_table_lookup (physical_devices, input_device);
++  if (!device)
++    {
++      device = g_new0 (PhysicalDevice, 1);
++      g_hash_table_insert (physical_devices, input_device, device);
++    }
++  if (type == LIBINPUT_EVENT_DEVICE_REMOVED)
++    {
++      for (guint i = 0; i < KEY_CNT; i++)
++        {
++          if (device->keys[i]) { physical_keys[i]--; physical_down--; }
++          if (device->auth_keys[i]) queue_local_key (i, FALSE);
++        }
++      physical_down -= device->contacts + device->tip + device->gesture;
++      g_hash_table_remove (physical_devices, input_device);
++    }
++  if (type == LIBINPUT_EVENT_DEVICE_ADDED || type == LIBINPUT_EVENT_DEVICE_REMOVED)
++    { g_mutex_unlock (&input_mutex); return FALSE; }
++  if (type == LIBINPUT_EVENT_KEYBOARD_KEY)
++    {
++      struct libinput_event_keyboard *k = libinput_event_get_keyboard_event (event);
++      key = libinput_event_keyboard_get_key (k);
++      down = libinput_event_keyboard_get_key_state (k) == LIBINPUT_KEY_STATE_PRESSED;
++    }
++  else if (type == LIBINPUT_EVENT_POINTER_BUTTON)
++    {
++      struct libinput_event_pointer *p = libinput_event_get_pointer_event (event);
++      key = libinput_event_pointer_get_button (p);
++      down = libinput_event_pointer_get_button_state (p) == LIBINPUT_BUTTON_STATE_PRESSED;
++    }
++  else if (type == LIBINPUT_EVENT_TABLET_TOOL_BUTTON)
++    {
++      struct libinput_event_tablet_tool *t = libinput_event_get_tablet_tool_event (event);
++      key = libinput_event_tablet_tool_get_button (t);
++      down = libinput_event_tablet_tool_get_button_state (t) == LIBINPUT_BUTTON_STATE_PRESSED;
++    }
++  remote = meta_native_privacy_active ();
++  drop = remote;
++  if (key < KEY_CNT)
++    {
++      drop |= device->blocked_keys[key];
++      if (device->keys[key] != down)
++        {
++          if (remote && type == LIBINPUT_EVENT_KEYBOARD_KEY)
++            {
++              if (down && !device->blocked_keys[key])
++                { device->auth_keys[key] = TRUE; queue_local_key (key, TRUE); }
++              else if (!down && device->auth_keys[key])
++                { device->auth_keys[key] = FALSE; queue_local_key (key, FALSE); }
++            }
++          device->keys[key] = down;
++          if (down) { physical_down++; physical_keys[key]++; }
++          else { physical_down--; physical_keys[key]--; }
++        }
++      if (remote && down) device->blocked_keys[key] = TRUE;
++      if (!down) device->blocked_keys[key] = FALSE;
++      if (!drop) device->delivered_keys[key] = down ? type : 0;
++    }
++  if (type >= LIBINPUT_EVENT_TOUCH_DOWN && type <= LIBINPUT_EVENT_TOUCH_FRAME)
++    {
++      drop |= device->blocked_touch;
++      if (type == LIBINPUT_EVENT_TOUCH_DOWN) { physical_down++; device->contacts++; }
++      if (type == LIBINPUT_EVENT_TOUCH_UP && device->contacts) { physical_down--; device->contacts--; }
++      if (type == LIBINPUT_EVENT_TOUCH_CANCEL) { physical_down -= device->contacts; device->contacts = 0; }
++      if (remote && device->contacts) device->blocked_touch = TRUE;
++      if (!device->contacts) device->blocked_touch = FALSE;
++      if (!drop && type != LIBINPUT_EVENT_TOUCH_FRAME)
++        {
++          int slot = libinput_event_touch_get_seat_slot (libinput_event_get_touch_event (event));
++          if (!device->touch_slots) device->touch_slots = g_hash_table_new (NULL, NULL);
++          if (type == LIBINPUT_EVENT_TOUCH_DOWN)
++            g_hash_table_add (device->touch_slots, GINT_TO_POINTER (slot + 1));
++          else if (type == LIBINPUT_EVENT_TOUCH_UP || type == LIBINPUT_EVENT_TOUCH_CANCEL)
++            g_hash_table_remove (device->touch_slots, GINT_TO_POINTER (slot + 1));
++        }
++    }
++  if (type == LIBINPUT_EVENT_TABLET_TOOL_AXIS || type == LIBINPUT_EVENT_TABLET_TOOL_TIP)
++    drop |= device->blocked_tip;
++  if (type == LIBINPUT_EVENT_TABLET_TOOL_TIP)
++    {
++      gboolean tip = libinput_event_tablet_tool_get_tip_state (
++                      libinput_event_get_tablet_tool_event (event)) == LIBINPUT_TABLET_TOOL_TIP_DOWN;
++      if (device->tip != tip) { if (tip) physical_down++; else physical_down--; device->tip = tip; }
++      if (remote && tip) device->blocked_tip = TRUE;
++      if (!tip) device->blocked_tip = FALSE;
++      if (!drop) device->delivered_tip = tip;
++    }
++  if (type >= LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN && type <= LIBINPUT_EVENT_GESTURE_HOLD_END)
++    {
++      drop |= device->blocked_gesture;
++      if (type == LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN || type == LIBINPUT_EVENT_GESTURE_PINCH_BEGIN ||
++          type == LIBINPUT_EVENT_GESTURE_HOLD_BEGIN)
++        {
++          if (!device->gesture) { device->gesture = TRUE; physical_down++; }
++          if (remote) device->blocked_gesture = TRUE;
++          if (!drop)
++            {
++              device->delivered_gesture = type;
++              device->gesture_fingers = libinput_event_gesture_get_finger_count (libinput_event_get_gesture_event (event));
++            }
++        }
++      if (type == LIBINPUT_EVENT_GESTURE_SWIPE_END || type == LIBINPUT_EVENT_GESTURE_PINCH_END ||
++          type == LIBINPUT_EVENT_GESTURE_HOLD_END)
++        {
++          if (device->gesture) { device->gesture = FALSE; physical_down--; }
++          device->blocked_gesture = FALSE;
++          if (!drop) device->delivered_gesture = 0;
++        }
++    }
++  g_mutex_unlock (&input_mutex);
++  return drop;
++}
++
++/* Releases are deliberately allowed through the main-thread privacy barrier:
++ * the raw filter blocks new physical releases while remote, so these are the
++ * state-neutralizing events (or releases already queued before the barrier). */
++gboolean
++meta_native_privacy_is_cleanup_event (const ClutterEvent *event)
++{
++  switch (clutter_event_type (event))
++    {
++    case CLUTTER_KEY_RELEASE:
++    case CLUTTER_KEY_STATE:
++    case CLUTTER_BUTTON_RELEASE:
++    case CLUTTER_TOUCH_CANCEL:
++    case CLUTTER_PROXIMITY_OUT:
++      return TRUE;
++    case CLUTTER_TOUCHPAD_PINCH:
++    case CLUTTER_TOUCHPAD_SWIPE:
++    case CLUTTER_TOUCHPAD_HOLD:
++      return clutter_event_get_gesture_phase (event) == CLUTTER_TOUCHPAD_GESTURE_PHASE_CANCEL;
++    default:
++      return FALSE;
++    }
++}
++
++static gboolean
++input_reset_finished (gpointer data)
++{
++  input_reset_pending = FALSE;
++  clutter_actor_queue_redraw (CLUTTER_ACTOR (stage ()));
++  g_message ("[NativeTakeover] Physical input isolated; delivered presses released");
++  return G_SOURCE_REMOVE;
++}
++
++/* Serialized with raw libinput dispatch on the input thread. No remote lease
++ * is granted until these releases have been processed on the main thread and
++ * every physical output has acknowledged a black frame. */
++static gboolean
++reset_physical_input_in_impl (gpointer data)
++{
++  MetaSeatImpl *seat_impl = data;
++  GHashTableIter iter;
++  gpointer input_device, value;
++  gboolean released[KEY_CNT] = { FALSE };
++  uint64_t now = g_get_monotonic_time ();
++
++  g_mutex_lock (&input_mutex);
++  if (physical_devices)
++    {
++      g_hash_table_iter_init (&iter, physical_devices);
++      while (g_hash_table_iter_next (&iter, &input_device, &value))
++        {
++          PhysicalDevice *state = value;
++          ClutterInputDevice *device = state->test_device ? state->test_device : libinput_device_get_user_data (input_device);
++          for (guint key = 0; key < KEY_CNT; key++)
++            {
++              enum libinput_event_type type = state->delivered_keys[key];
++              state->blocked_keys[key] = state->keys[key];
++              state->delivered_keys[key] = 0;
++              if (!device || !type || !seat_impl->button_count[key]) continue;
++              if (type != LIBINPUT_EVENT_TABLET_TOOL_BUTTON && released[key]) continue;
++              released[key] = TRUE;
++              if (type == LIBINPUT_EVENT_KEYBOARD_KEY)
++                meta_seat_impl_notify_key_in_impl (seat_impl, device, now, key, 0, TRUE);
++              else
++                meta_seat_impl_notify_button_in_impl (seat_impl, device, now, key, 0);
++            }
++          if (state->touch_slots)
++            {
++              GHashTableIter slots;
++              gpointer slot;
++              g_hash_table_iter_init (&slots, state->touch_slots);
++              while (g_hash_table_iter_next (&slots, &slot, NULL))
++                if (device)
++                  meta_seat_impl_notify_touch_event_in_impl (seat_impl, device,
++                    CLUTTER_TOUCH_CANCEL, now, GPOINTER_TO_INT (slot) - 1, 0, 0);
++              g_hash_table_remove_all (state->touch_slots);
++            }
++          state->blocked_touch = state->contacts > 0;
++          if (device && state->delivered_tip && seat_impl->button_count[BTN_TOUCH])
++            meta_seat_impl_notify_button_in_impl (seat_impl, device, now, BTN_TOUCH, 0);
++          state->delivered_tip = FALSE;
++          state->blocked_tip = state->tip;
++          if (device && state->delivered_gesture)
++            {
++              ClutterEvent *event = NULL;
++              graphene_point_t zero = { 0, 0 };
++              switch (state->delivered_gesture)
++                {
++                case LIBINPUT_EVENT_GESTURE_PINCH_BEGIN:
++                  event = clutter_event_touchpad_pinch_new (CLUTTER_EVENT_NONE, now,
++                    device, CLUTTER_TOUCHPAD_GESTURE_PHASE_CANCEL,
++                    state->gesture_fingers, zero, zero, zero, 0, 1);
++                  break;
++                case LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN:
++                  event = clutter_event_touchpad_swipe_new (CLUTTER_EVENT_NONE, now,
++                    device, CLUTTER_TOUCHPAD_GESTURE_PHASE_CANCEL,
++                    state->gesture_fingers, zero, zero, zero);
++                  break;
++                case LIBINPUT_EVENT_GESTURE_HOLD_BEGIN:
++                  event = clutter_event_touchpad_hold_new (CLUTTER_EVENT_NONE, now,
++                    device, CLUTTER_TOUCHPAD_GESTURE_PHASE_CANCEL,
++                    state->gesture_fingers, zero);
++                  break;
++                default: break;
++                }
++              if (event) { _clutter_event_push (event, FALSE); }
++            }
++          state->delivered_gesture = 0;
++          state->blocked_gesture = state->gesture;
++        }
++    }
++  g_mutex_unlock (&input_mutex);
++  /* Input dispatch runs at DEFAULT priority. Complete at LOW priority so
++   * queued release/cancel events drain before presentation can grant a lease. */
++  g_idle_add_full (G_PRIORITY_LOW, input_reset_finished, NULL, NULL);
++  return G_SOURCE_REMOVE;
++}
++
++static gboolean
++reset_physical_input (gpointer task)
++{
++  reset_physical_input_in_impl (g_task_get_source_object (task));
++  g_task_return_boolean (task, TRUE);
++  return G_SOURCE_REMOVE;
++}
++
++static void
++reset_lock_observation (void)
++{
++  lock_epoch++;
++  if (lock_cancel) g_cancellable_cancel (lock_cancel);
++  g_clear_object (&lock_cancel);
++  lock_cancel = g_cancellable_new ();
++  lock_poll_pending = FALSE;
++  lock_request_pending = FALSE;
++  unlock_requested = FALSE;
++  saver_known = hint_known = FALSE;
++}
++
++static void
++show_local_surface (gboolean startup)
++{
++  if (!startup_local_ui)
++    {
++      ClutterKeymap *keymap = clutter_seat_get_keymap (meta_backend_get_default_seat (backend ()));
++      meta_native_local_lock_begin (CLUTTER_ACTOR (stage ()), meta_backend_get_xkb_keymap (backend ()),
++        meta_backend_get_keymap_layout_group (backend ()), clutter_keymap_get_caps_lock_state (keymap),
++        clutter_keymap_get_num_lock_state (keymap), test_mode, local_verified);
++      if (startup) startup_local_ui = TRUE;
++    }
++  meta_native_local_lock_set_recovery (startup);
++  clutter_actor_queue_redraw (CLUTTER_ACTOR (stage ()));
++}
++
++static void
++finish_lock (void)
++{
++  if (startup_privacy_active () && !g_atomic_int_get (&active) && !reclaiming)
++    {
++      gboolean was_ready = startup_guard_ready;
++      locking = FALSE;
++      startup_guard_ready = TRUE;
++      startup_failed = FALSE;
++      lock_reason = "dual-lock-confirmed";
++      show_local_surface (TRUE);
++      if (!was_ready)
++        g_message ("[NativeTakeover] Startup locked; holding physical privacy for authenticated takeover");
++      /* Keep observing until handover: GDM may still send a late Unlock. */
++      return;
++    }
++  if (timeout_id) { g_source_remove (timeout_id); timeout_id = 0; }
++  reset_lock_observation ();
++  if (owner_watch) { g_bus_unwatch_name (owner_watch); owner_watch = 0; }
++  meta_native_local_lock_end ();
++  g_atomic_int_inc (&lease_generation);
++  g_clear_pointer (&owner, g_free);
++  g_hash_table_remove_all (presented_views);
++  g_hash_table_remove_all (painted_views);
++  g_mutex_lock (&input_mutex);
++  g_atomic_int_set (&active, 0);
++  g_atomic_int_set (&startup_guard, 0);
++  startup_guard_ready = startup_failed = startup_local_ui = FALSE;
++  g_mutex_unlock (&input_mutex);
++  clutter_stage_set_offscreen_picking (stage (), FALSE);
++  locking = FALSE;
++  unlock_pending = FALSE;
++  gboolean authenticated = reclaiming;
++  reclaiming = FALSE;
++  startup_started = reclaim_started = 0;
++  if (!authenticated) lock_reason = "locked-local";
++  else if (!g_str_equal (lock_reason, "local-authenticated-shell-timeout"))
++    lock_reason = "local-authenticated";
++  meta_backend_uninhibit_hw_cursor (backend ());
++  meta_compositor_enable_unredirect (compositor ());
++  clutter_actor_queue_redraw (CLUTTER_ACTOR (stage ()));
++  /* Our inhibition remains held. Local PAM alone never restores remote access. */
++  g_message ("[NativeTakeover] Physical seat restored after %s",
++             authenticated ? "local password authentication" : "GNOME lock confirmation");
++}
++
++static void
++lock_request_done (GObject *source, GAsyncResult *result, gpointer data)
++{
++  g_autoptr (GVariant) reply = g_dbus_connection_call_finish (G_DBUS_CONNECTION (source), result, NULL);
++  if (GPOINTER_TO_UINT (data) != lock_epoch) return;
++  lock_request_pending = FALSE;
++  last_lock_request = g_get_monotonic_time ();
++  if (!reply && !startup_failed) lock_reason = "lock-request-unanswered";
++}
++
++static void
++request_lock (void)
++{
++  if (lock_request_pending || reclaiming || unlock_pending) return;
++  lock_request_pending = TRUE;
++  last_lock_request = g_get_monotonic_time ();
++  lock_retries++;
++  g_dbus_connection_call (privacy_bus, "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
++                         "org.gnome.ScreenSaver", "Lock", NULL, NULL,
++                         G_DBUS_CALL_FLAGS_NONE, 5000, lock_cancel, lock_request_done,
++                         GUINT_TO_POINTER (lock_epoch));
++}
++
++static void
++request_unlock (void)
++{
++  if (unlock_requested) return;
++  unlock_requested = TRUE;
++  last_unlock_request = g_get_monotonic_time ();
++  g_dbus_connection_call (privacy_bus, "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
++                         "org.gnome.ScreenSaver", "SetActive", g_variant_new ("(b)", FALSE), NULL,
++                         G_DBUS_CALL_FLAGS_NONE, 1500, lock_cancel, unlock_reply,
++                         GUINT_TO_POINTER (lock_epoch));
++}
++
++typedef struct {
++  guint epoch;
++  guint remaining;
++  gboolean saver_known, saver_active, hint_known, hint_locked;
++} LockObservation;
++
++static void
++apply_lock_observation (LockObservation *observation)
++{
++  gint64 now = g_get_monotonic_time ();
++  saver_known = observation->saver_known;
++  saver_active = observation->saver_active;
++  hint_known = observation->hint_known;
++  hint_locked = observation->hint_locked;
++  gboolean both_locked = saver_known && saver_active && hint_known && hint_locked;
++  gboolean both_unlocked = saver_known && !saver_active && hint_known && !hint_locked;
++
++  if (unlock_pending)
++    {
++      if (both_unlocked)
++        {
++          unlock_pending = FALSE;
++          if (reclaiming) finish_lock ();
++          else if (locking) start_lock ();
++          else if (begin_call)
++            {
++              if (remote_inhibited)
++                { meta_remote_access_controller_uninhibit_remote_access (controller ()); remote_inhibited = FALSE; }
++              g_dbus_method_invocation_return_value (begin_call, NULL);
++              g_clear_object (&begin_call);
++              show_local_surface (FALSE);
++              lock_reason = "remote-authenticated";
++              g_message ("[NativeTakeover] Original GNOME desktop unlocked behind physical privacy");
++            }
++          return;
++        }
++      if (!unlock_requested && now - last_unlock_request > G_USEC_PER_SEC)
++        request_unlock ();
++      return;
++    }
++
++  if (startup_privacy_active () && startup_guard_ready && !both_locked)
++    {
++      startup_guard_ready = FALSE;
++      locking = TRUE;
++      startup_started = now;
++      lock_reason = "startup-lock-confirmation-lost";
++      g_message ("[NativeTakeover] Startup lock confirmation lost; retaining privacy and local authentication");
++    }
++  if (locking || (startup_privacy_active () && startup_failed))
++    {
++      if (both_locked && !input_reset_pending) finish_lock ();
++      else if (!lock_request_pending &&
++               now - last_lock_request > (startup_failed ? 5 : 1) * G_USEC_PER_SEC)
++        {
++          /* Lock may precede GNOME's asynchronous logind proxy. Repeating the
++           * real Lock resynchronizes LockedHint even when GetActive is true. */
++          request_lock ();
++        }
++    }
++}
++
++static void
++complete_lock_observation (LockObservation *observation)
++{
++  if (--observation->remaining) return;
++  if (observation->epoch == lock_epoch)
++    {
++      lock_poll_pending = FALSE;
++      apply_lock_observation (observation);
++    }
++  g_free (observation);
++}
++
++static void
++active_reply (GObject *source, GAsyncResult *result, gpointer data)
++{
++  LockObservation *observation = data;
++  g_autoptr (GVariant) reply = g_dbus_connection_call_finish (G_DBUS_CONNECTION (source), result, NULL);
++  if (reply)
++    {
++      observation->saver_known = TRUE;
++      g_variant_get (reply, "(b)", &observation->saver_active);
++    }
++  complete_lock_observation (observation);
++}
++
++static void
++hint_reply (GObject *source, GAsyncResult *result, gpointer data)
++{
++  LockObservation *observation = data;
++  g_autoptr (GVariant) reply = g_dbus_connection_call_finish (G_DBUS_CONNECTION (source), result, NULL);
++  g_autoptr (GVariant) value = NULL;
++  if (reply)
++    {
++      g_variant_get (reply, "(v)", &value);
++      if (g_variant_is_of_type (value, G_VARIANT_TYPE_BOOLEAN))
++        {
++          observation->hint_known = TRUE;
++          observation->hint_locked = g_variant_get_boolean (value);
++        }
++    }
++  complete_lock_observation (observation);
++}
++
++static gboolean
++poll_lock (gpointer data)
++{
++  gint64 now = g_get_monotonic_time ();
++  if (reclaiming && reclaim_started && now - reclaim_started >= reclaim_timeout_us)
++    {
++      /* PAM has authenticated the physical user and controller inhibition has
++       * synchronously closed all capture/input sessions. A broken ScreenShield
++       * must not strand that user behind our own black/input barrier. */
++      if (!local_authenticated || !remote_inhibited) return G_SOURCE_CONTINUE;
++      lock_reason = "local-authenticated-shell-timeout";
++      g_warning ("[NativeTakeover] Shell unlock did not confirm; restoring authenticated local access with remote access inhibited");
++      finish_lock ();
++      return G_SOURCE_REMOVE;
++    }
++  if (startup_privacy_active () && !startup_guard_ready && !startup_failed &&
++      startup_started && !reclaiming && now - startup_started >= startup_timeout_us)
++    {
++      startup_failed = TRUE;
++      locking = FALSE;
++      lock_reason = "startup-lock-timeout";
++      show_local_surface (TRUE);
++      g_warning ("[NativeTakeover] Startup lock timed out (ScreenSaver known=%d active=%d; logind known=%d locked=%d); privacy held, local password recovery available",
++                 saver_known, saver_active, hint_known, hint_locked);
++    }
++  if (!locking && !unlock_pending && !startup_privacy_active ())
++    { timeout_id = 0; return G_SOURCE_REMOVE; }
++  if (!lock_poll_pending)
++    {
++      LockObservation *observation = g_new0 (LockObservation, 1);
++      observation->epoch = lock_epoch;
++      observation->remaining = 2;
++      lock_poll_pending = TRUE;
++      g_dbus_connection_call (privacy_bus, "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
++                             "org.gnome.ScreenSaver", "GetActive", NULL, G_VARIANT_TYPE ("(b)"),
++                             G_DBUS_CALL_FLAGS_NONE, 1500, lock_cancel, active_reply, observation);
++      /* Headless fault injection uses a real independent fake logind property
++       * on the private test bus. It never replaces confirmation with TRUE. */
++      GDBusConnection *bus = test_mode ? privacy_bus : system_bus;
++      if (bus && session_path)
++        g_dbus_connection_call (bus, "org.freedesktop.login1", session_path,
++          "org.freedesktop.DBus.Properties", "Get",
++          g_variant_new ("(ss)", "org.freedesktop.login1.Session", "LockedHint"),
++          G_VARIANT_TYPE ("(v)"), G_DBUS_CALL_FLAGS_NONE, 1500, lock_cancel, hint_reply, observation);
++      else
++        complete_lock_observation (observation);
++    }
++  return G_SOURCE_CONTINUE;
++}
++
++static void
++start_lock (void)
++{
++  if (!meta_native_privacy_active ()) return;
++  if (reclaiming) return; /* Already revoked after successful local authentication. */
++  if (!startup_local_ui) meta_native_local_lock_end ();
++  gboolean pending_unlock_request = unlock_pending && unlock_requested;
++  reset_lock_observation ();
++  /* Do not duplicate a remote unlock whose asynchronous side effects may
++   * still complete. Observe that request becoming unlocked before re-locking. */
++  unlock_requested = pending_unlock_request;
++  if (startup_privacy_active () && !startup_started)
++    startup_started = g_get_monotonic_time ();
++  if (begin_call)
++    {
++      g_dbus_method_invocation_return_dbus_error (begin_call,
++        "org.gnome.Mutter.NativeTakeover.Cancelled", "Privacy handover cancelled");
++      g_clear_object (&begin_call);
++    }
++  if (timeout_id) { g_source_remove (timeout_id); timeout_id = 0; }
++  locking = TRUE;
++  lock_reason = startup_privacy_active () ? "startup-lock-pending" : "lock-pending";
++  clutter_actor_queue_redraw (CLUTTER_ACTOR (stage ()));
++  if (!remote_inhibited)
++    {
++      meta_remote_access_controller_inhibit_remote_access (controller ());
++      remote_inhibited = TRUE;
++    }
++  g_dbus_connection_emit_signal (privacy_bus, NULL, "/org/gnome/Mutter/NativeTakeover",
++                                "org.gnome.Mutter.NativeTakeover", "Revoked", NULL, NULL);
++  if (greeter_mode)
++    {
++      if (greeter_shell_uninhibited)
++        {
++          meta_remote_access_controller_inhibit_remote_access (controller ());
++          greeter_shell_uninhibited = FALSE;
++        }
++      /* Returning to an actual GDM greeter cannot expose a user desktop. */
++      finish_lock ();
++      return;
++    }
++  if (!unlock_pending)
++    request_lock ();
++  timeout_id = g_timeout_add (100, poll_lock, NULL);
++  g_message ("[NativeTakeover] Revoked; holding privacy until GNOME lock confirmation");
++}
++
++static void
++local_verified (void)
++{
++  if (!meta_native_privacy_active () || (locking && !startup_local_ui) ||
++      begin_call || reclaiming) return;
++  local_authenticated = TRUE;
++  reclaiming = TRUE;
++  locking = TRUE;
++  reclaim_started = g_get_monotonic_time ();
++  reset_lock_observation ();
++  if (!remote_inhibited)
++    {
++      meta_remote_access_controller_inhibit_remote_access (controller ());
++      remote_inhibited = TRUE;
++    }
++  g_dbus_connection_emit_signal (privacy_bus, NULL, "/org/gnome/Mutter/NativeTakeover",
++                                "org.gnome.Mutter.NativeTakeover", "Revoked", NULL, NULL);
++  /* Stay behind physical privacy until any remote ScreenShield lock is also
++   * deactivated. Authentication is bound to this still-current lease. */
++  unlock_pending = TRUE;
++  unlock_requested = FALSE;
++  last_unlock_request = 0;
++  lock_reason = "local-authenticated-revoking";
++  if (timeout_id) g_source_remove (timeout_id);
++  timeout_id = g_timeout_add (100, poll_lock, NULL);
++  g_message ("[NativeTakeover] Local password verified; revoked remote before physical restore");
++}
++
++static void
++owner_gone (GDBusConnection *connection, const char *name, gpointer data)
++{ start_lock (); }
++
++static void
++unlock_reply (GObject *source, GAsyncResult *result, gpointer data)
++{
++  g_autoptr (GVariant) reply = g_dbus_connection_call_finish (G_DBUS_CONNECTION (source), result, NULL);
++  if (GPOINTER_TO_UINT (data) != lock_epoch) return;
++  if (reclaiming) unlock_requested = FALSE;
++  last_unlock_request = g_get_monotonic_time ();
++  if (!reply && unlock_pending && !reclaiming)
++    {
++      /* A timeout does not prove that Shell did not accept the request. Keep
++       * waiting for its actual state; never expose an ambiguously unlocked UI. */
++      start_lock ();
++    }
++}
++
++void
++meta_native_privacy_painted (ClutterStageView *view, ClutterFrame *frame)
++{
++  int64_t *count;
++  if (!begin_call || g_hash_table_contains (painted_views, view)) return;
++  count = g_new (int64_t, 1);
++  *count = clutter_frame_get_count (frame);
++  g_hash_table_insert (painted_views, g_object_ref (view), count);
++}
++
++static void
++presented (ClutterStage *unused, ClutterStageView *view, ClutterFrameInfo *info, gpointer data)
++{
++  int64_t *count;
++  GList *views, *l;
++  if (!begin_call || unlock_pending || input_reset_pending) return;
++  count = g_hash_table_lookup (painted_views, view);
++  if (!count || info->view_frame_counter < *count) return;
++  g_hash_table_add (presented_views, view);
++  views = clutter_stage_peek_stage_views (stage ());
++  if (!views) return;
++  for (l = views; l; l = l->next)
++    if (!g_hash_table_contains (presented_views, l->data)) return;
++  if (timeout_id) { g_source_remove (timeout_id); timeout_id = 0; }
++  if (greeter_mode)
++    {
++      if (remote_inhibited)
++        { meta_remote_access_controller_uninhibit_remote_access (controller ()); remote_inhibited = FALSE; }
++      /* Shell's gdm mode contributes one inhibit. Borrow it only during
++       * this authenticated, physically private lease, then restore on End. */
++      meta_remote_access_controller_uninhibit_remote_access (controller ());
++      greeter_shell_uninhibited = TRUE;
++      g_dbus_method_invocation_return_value (begin_call, NULL);
++      g_clear_object (&begin_call);
++      g_message ("[NativeTakeover] GDM greeter captured behind physical privacy; authentication remains with GDM");
++      return;
++    }
++  /* Only after real presentation acknowledgements may the original session
++   * unlock. Keep ownership and the black/input barrier during its async work. */
++  unlock_pending = TRUE;
++  unlock_requested = FALSE;
++  last_unlock_request = 0;
++  /* First inspect the lock state. Calling deactivate on an already unlocked
++   * ScreenShield would schedule a redundant, late _completeDeactivate(). */
++  timeout_id = g_timeout_add (100, poll_lock, NULL);
++  g_message ("[NativeTakeover] All current outputs presented black; unlocking original scene");
++}
++
++static gboolean
++blank_timeout (gpointer data)
++{
++  timeout_id = 0;
++  start_lock ();
++  return G_SOURCE_REMOVE;
++}
++
++static GVariant *
++session_properties (const char *path)
++{
++  g_autoptr (GVariant) reply = NULL;
++  GVariant *props;
++
++  if (!system_bus) return NULL;
++  reply = g_dbus_connection_call_sync (system_bus, "org.freedesktop.login1", path,
++    "org.freedesktop.DBus.Properties", "GetAll",
++    g_variant_new ("(s)", "org.freedesktop.login1.Session"), G_VARIANT_TYPE ("(a{sv})"),
++    G_DBUS_CALL_FLAGS_NONE, 1000, NULL, NULL);
++  if (!reply) return NULL;
++  g_variant_get (reply, "(@a{sv})", &props);
++  return props;
++}
++
++static gboolean
++session_matches (GVariant   *props,
++                 uid_t       expected_uid,
++                 const char *expected_class)
++{
++  guint uid;
++  gboolean remote;
++  const char *user_path, *seat, *seat_path, *type, *klass, *state;
++
++  if (props && g_variant_lookup (props, "State", "&s", &state) &&
++      g_str_equal (state, "closing")) return FALSE;
++
++  return props &&
++    g_variant_lookup (props, "User", "(u&o)", &uid, &user_path) && uid == expected_uid &&
++    g_variant_lookup (props, "Seat", "(&s&o)", &seat, &seat_path) && g_str_equal (seat, "seat0") &&
++    g_variant_lookup (props, "Type", "&s", &type) && g_str_equal (type, "wayland") &&
++    g_variant_lookup (props, "Class", "&s", &klass) &&
++    g_str_equal (klass, expected_class) &&
++    g_variant_lookup (props, "Remote", "b", &remote) && !remote;
++}
++
++static gboolean
++is_gdm_account (uid_t uid)
++{
++  struct passwd *account = getpwuid (uid);
++  gid_t primary_gid;
++  struct group *gdm_group;
++
++  if (!account) return FALSE;
++  primary_gid = account->pw_gid;
++  gdm_group = getgrnam ("gdm");
++  return gdm_group && primary_gid == gdm_group->gr_gid;
++}
++
++static char *
++find_greeter_session (void)
++{
++  g_autoptr (GVariant) reply = NULL;
++  g_autoptr (GVariant) sessions = NULL;
++  g_autofree char *matched = NULL;
++  GVariantIter iter;
++  const char *id, *name, *seat, *path;
++  guint uid;
++
++  /* GDM creates ephemeral NSS users whose primary group remains gdm. A name
++   * prefix or group membership alone is not authority to capture a greeter. */
++  if (!system_bus || !is_gdm_account (getuid ())) return NULL;
++  reply = g_dbus_connection_call_sync (system_bus, "org.freedesktop.login1",
++    "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "ListSessions",
++    NULL, G_VARIANT_TYPE ("(a(susso))"), G_DBUS_CALL_FLAGS_NONE, 2000, NULL, NULL);
++  if (!reply) return NULL;
++  g_variant_get (reply, "(@a(susso))", &sessions);
++  g_variant_iter_init (&iter, sessions);
++  while (g_variant_iter_loop (&iter, "(&su&s&s&o)", &id, &uid, &name, &seat, &path))
++    {
++      g_autoptr (GVariant) props = NULL;
++      if (uid != getuid () || !g_str_equal (seat, "seat0")) continue;
++      props = session_properties (path);
++      if (!session_matches (props, uid, "greeter")) continue;
++      if (matched) return NULL; /* Ambiguous physical sessions fail closed. */
++      matched = g_strdup (path);
++    }
++  return g_steal_pointer (&matched);
++}
++
++static char *
++find_greeter_session_with_retry (void)
++{
++  for (guint attempt = 0; attempt < 3; attempt++)
++    {
++      char *path = find_greeter_session ();
++      if (path) return path;
++      if (attempt < 2) g_usleep (250 * 1000);
++    }
++  return NULL;
++}
++
++static gboolean
++validate_session (const char *path)
++{
++  g_autoptr (GVariant) props = NULL;
++
++  if (test_mode) return TRUE;
++  if (greeter_mode && (!is_gdm_account (getuid ()) ||
++                      g_strcmp0 (path, greeter_session_path) != 0)) return FALSE;
++  props = session_properties (path);
++  return session_matches (props, getuid (), greeter_mode ? "greeter" : "user");
++}
++
++/* Fault injection is restricted to explicitly enabled, headless test mode.
++ * Use real native-seat notifications so the integration test verifies XKB,
++ * repeat and pointer-button state, not just the bookkeeping in the filter. */
++static gboolean
++test_input_task (gpointer data)
++{
++  GDBusMethodInvocation *invocation = g_task_get_task_data (data);
++  MetaSeatImpl *seat_impl = g_task_get_source_object (data);
++  const char *method = g_dbus_method_invocation_get_method_name (invocation);
++  if (g_str_equal (method, "TestInputState"))
++    {
++      guint count = 0;
++      for (guint k = 0; k < KEY_CNT; k++) count += seat_impl->button_count[k];
++      g_dbus_method_invocation_return_value (invocation, g_variant_new ("(uub)", count,
++        xkb_state_serialize_mods (seat_impl->xkb, XKB_STATE_MODS_DEPRESSED),
++        seat_impl->repeat_source != NULL));
++    }
++  else
++    {
++      const guint keys[] = { KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_BRIGHTNESSDOWN,
++                             KEY_BRIGHTNESSUP, KEY_MICMUTE };
++      g_mutex_lock (&input_mutex);
++      if (!physical_devices)
++        physical_devices = g_hash_table_new_full (NULL, NULL, NULL,
++                                                  (GDestroyNotify) physical_device_free);
++      for (int pointer = 0; pointer < 2; pointer++)
++        {
++          PhysicalDevice *state = g_new0 (PhysicalDevice, 1);
++          state->test_device = meta_input_device_native_new_virtual_in_impl (seat_impl,
++                                pointer ? CLUTTER_POINTER_DEVICE : CLUTTER_KEYBOARD_DEVICE);
++          meta_seat_impl_add_virtual_input_device (seat_impl, state->test_device);
++          /* Avoid activating Shell's top-left hot corner while seeding a drag. */
++          if (pointer)
++            meta_seat_impl_notify_absolute_motion_in_impl (seat_impl, state->test_device,
++                                                           g_get_monotonic_time (), 450, 300, NULL);
++          g_hash_table_insert (physical_devices, state->test_device, state);
++          for (guint i = 0; i < (pointer ? 1 : G_N_ELEMENTS (keys)); i++)
++            {
++              guint key = pointer ? BTN_LEFT : keys[i];
++              state->keys[key] = TRUE;
++              state->delivered_keys[key] = pointer ? LIBINPUT_EVENT_POINTER_BUTTON : LIBINPUT_EVENT_KEYBOARD_KEY;
++              physical_keys[key]++; physical_down++;
++              if (pointer)
++                meta_seat_impl_notify_button_in_impl (seat_impl, state->test_device,
++                                                      g_get_monotonic_time (), key, 1);
++              else
++                meta_seat_impl_notify_key_in_impl (seat_impl, state->test_device,
++                                                   g_get_monotonic_time (), key, 1, TRUE);
++            }
++        }
++      g_mutex_unlock (&input_mutex);
++      g_dbus_method_invocation_return_value (invocation, NULL);
++    }
++  return G_SOURCE_REMOVE;
++}
++
++static void
++method_call (GDBusConnection *connection, const char *sender, const char *path,
++             const char *interface, const char *method, GVariant *params,
++             GDBusMethodInvocation *invocation, gpointer data)
++{
++  if (test_mode && (g_str_equal (method, "TestInputState") ||
++                   (g_str_equal (method, "TestHoldInput") && !meta_native_privacy_active ())))
++    {
++      MetaSeatNative *seat = META_SEAT_NATIVE (meta_backend_get_default_seat (backend ()));
++      meta_seat_native_run_impl_task (seat, test_input_task, g_object_ref (invocation), g_object_unref);
++      return;
++    }
++  if (g_str_equal (method, "GetState"))
++    { g_dbus_method_invocation_return_value (invocation, g_variant_new ("(s)", state ())); return; }
++  if (g_str_equal (method, "GetStatus"))
++    {
++      GVariantBuilder status;
++      g_variant_builder_init (&status, G_VARIANT_TYPE ("a{sv}"));
++      g_variant_builder_add (&status, "{sv}", "state", g_variant_new_string (state ()));
++      g_variant_builder_add (&status, "{sv}", "local-authenticated", g_variant_new_boolean (local_authenticated));
++      g_variant_builder_add (&status, "{sv}", "has-owner", g_variant_new_boolean (owner != NULL));
++      g_variant_builder_add (&status, "{sv}", "remote-inhibited", g_variant_new_boolean (remote_inhibited));
++      g_variant_builder_add (&status, "{sv}", "session-path", g_variant_new_string (session_path ? session_path : ""));
++      g_variant_builder_add (&status, "{sv}", "screensaver-known", g_variant_new_boolean (saver_known));
++      g_variant_builder_add (&status, "{sv}", "screensaver-active", g_variant_new_boolean (saver_active));
++      g_variant_builder_add (&status, "{sv}", "logind-known", g_variant_new_boolean (hint_known));
++      g_variant_builder_add (&status, "{sv}", "logind-locked", g_variant_new_boolean (hint_locked));
++      g_variant_builder_add (&status, "{sv}", "lock-request-pending", g_variant_new_boolean (lock_request_pending));
++      g_variant_builder_add (&status, "{sv}", "lock-retries", g_variant_new_uint32 (lock_retries));
++      g_variant_builder_add (&status, "{sv}", "elapsed-ms", g_variant_new_uint64 (startup_started ?
++        (g_get_monotonic_time () - startup_started) / 1000 : 0));
++      g_variant_builder_add (&status, "{sv}", "reason", g_variant_new_string (lock_reason));
++      g_dbus_method_invocation_return_value (invocation, g_variant_new ("(a{sv})", &status));
++      return;
++    }
++  if (test_mode && g_str_equal (method, "TestLocalKey"))
++    {
++      guint key; gboolean down;
++      g_variant_get (params, "(ub)", &key, &down);
++      if (meta_native_privacy_active () && (!locking || startup_local_ui) && !begin_call && !reclaiming)
++        meta_native_local_lock_key (key, down, TRUE);
++      g_dbus_method_invocation_return_value (invocation, NULL);
++      return;
++    }
++  if (g_str_equal (method, "InspectPhysical") && test_mode)
++    {
++      guint n = 0;
++      gboolean black = TRUE;
++      GList *l;
++      for (l = clutter_stage_peek_stage_views (stage ()); l; l = l->next)
++        {
++          CoglFramebuffer *fb = clutter_stage_view_get_framebuffer (l->data);
++          int w = cogl_framebuffer_get_width (fb), h = cogl_framebuffer_get_height (fb);
++          g_autofree guint8 *pixels = g_malloc (w * h * 4);
++          black &= cogl_framebuffer_read_pixels (fb, 0, 0, w, h, COGL_PIXEL_FORMAT_BGRA_8888_PRE, pixels);
++          if (n == 0 && !begin_call && (!locking || startup_local_ui || reclaiming) && meta_native_privacy_active () &&
++              g_getenv ("MUTTER_NATIVE_TEST_FRAME"))
++            {
++              cairo_surface_t *surface = cairo_image_surface_create_for_data (pixels,
++                CAIRO_FORMAT_ARGB32, w, h, w * 4);
++              cairo_surface_write_to_png (surface, g_getenv ("MUTTER_NATIVE_TEST_FRAME"));
++              cairo_surface_destroy (surface);
++            }
++          for (int i = 0; i < w * h; i++)
++            if (pixels[i*4] || pixels[i*4+1] || pixels[i*4+2]) { black = FALSE; break; }
++          n++;
++        }
++      g_dbus_method_invocation_return_value (invocation, g_variant_new ("(ub)", n, black && n > 0));
++      return;
++    }
++  if (g_str_equal (method, "PrepareLogin") && startup_privacy_active ())
++    {
++      const char *session;
++      g_variant_get (params, "(&o)", &session);
++      if (!greeter_mode && validate_session (session) &&
++          (!session_path || g_str_equal (session_path, session)))
++        {
++          if (startup_started || startup_guard_ready || reclaiming)
++            {
++              g_dbus_method_invocation_return_value (invocation, NULL);
++              return; /* Idempotent: never reset deadlines or password input. */
++            }
++          g_free (session_path);
++          session_path = g_strdup (session);
++          meta_compositor_disable_unredirect (compositor ());
++          meta_backend_inhibit_hw_cursor (backend ());
++          start_lock ();
++          g_dbus_method_invocation_return_value (invocation, NULL);
++          return;
++        }
++    }
++  if (g_str_equal (method, "End"))
++    {
++      if (!owner || g_str_equal (owner, sender))
++        { start_lock (); g_dbus_method_invocation_return_value (invocation, NULL); return; }
++    }
++  else if (g_str_equal (method, "Begin") &&
++           (!meta_native_privacy_active () || (startup_guard_ready && !locking && !begin_call)))
++    {
++      const char *session;
++      g_variant_get (params, "(&o)", &session);
++      if (!validate_session (session))
++        {
++          g_dbus_method_invocation_return_dbus_error (invocation,
++            "org.gnome.Mutter.NativeTakeover.Denied", "Invalid physical session");
++          return;
++        }
++      gboolean from_startup_guard = startup_guard_ready;
++      if (timeout_id) { g_source_remove (timeout_id); timeout_id = 0; }
++      reset_lock_observation ();
++      meta_native_local_lock_end ();
++      startup_local_ui = startup_failed = local_authenticated = FALSE;
++      startup_started = reclaim_started = 0;
++      lock_reason = "remote-blanking";
++      lock_retries = 0;
++      g_mutex_lock (&input_mutex);
++      g_atomic_int_inc (&lease_generation);
++      g_atomic_int_set (&active, 1);
++      g_atomic_int_set (&startup_guard, 0);
++      startup_guard_ready = FALSE;
++      g_mutex_unlock (&input_mutex);
++      clutter_stage_set_offscreen_picking (stage (), TRUE);
++      g_free (session_path);
++      session_path = g_strdup (session);
++      owner = g_strdup (sender);
++      owner_watch = g_bus_watch_name_on_connection (connection, sender,
++                        G_BUS_NAME_WATCHER_FLAGS_NONE, NULL, owner_gone, NULL, NULL);
++      begin_call = g_object_ref (invocation);
++      input_reset_pending = TRUE;
++      {
++        ClutterSeat *seat = meta_backend_get_default_seat (backend ());
++        g_assert (META_IS_SEAT_NATIVE (seat));
++        meta_seat_native_run_impl_task (META_SEAT_NATIVE (seat), reset_physical_input,
++                                       g_object_ref (META_SEAT_NATIVE (seat)->impl), g_object_unref);
++      }
++      g_hash_table_remove_all (painted_views);
++      g_hash_table_remove_all (presented_views);
++      if (!from_startup_guard)
++        {
++          meta_compositor_disable_unredirect (compositor ());
++          meta_backend_inhibit_hw_cursor (backend ());
++        }
++      clutter_actor_queue_redraw (CLUTTER_ACTOR (stage ()));
++      timeout_id = g_timeout_add (5000, blank_timeout, NULL);
++      return;
++    }
++  g_dbus_method_invocation_return_dbus_error (invocation,
++    "org.gnome.Mutter.NativeTakeover.Denied", "Busy or wrong lease owner");
++}
++
++static const GDBusInterfaceVTable vtable = { .method_call = method_call };
++
++void
++meta_native_privacy_init (MetaContext *context)
++{
++  g_autoptr (GDBusNodeInfo) info = NULL;
++  g_autoptr (GError) error = NULL;
++  if (g_strcmp0 (g_getenv ("MUTTER_NATIVE_TAKEOVER"), "1") != 0) return;
++  /* Shell prepends its compiled-in GI directories after reading environment
++   * search paths. Reorder its existing default repository before JS starts.
++   * Resolve the public GLib GI API only when loaded by Shell; plain Mutter does
++   * not need or load a JavaScript/introspection dependency. */
++  if (g_getenv ("MUTTER_NATIVE_TYPELIB_DIR"))
++    {
++      GModule *module = g_module_open (NULL, 0);
++      GObject *(* dup_default) (void) = NULL;
++      void (* prepend_library) (GObject *, const char *) = NULL;
++      void (* prepend_search) (GObject *, const char *) = NULL;
++      if (g_module_symbol (module, "gi_repository_dup_default", (gpointer *) &dup_default) &&
++          g_module_symbol (module, "gi_repository_prepend_library_path", (gpointer *) &prepend_library) &&
++          g_module_symbol (module, "gi_repository_prepend_search_path", (gpointer *) &prepend_search))
++        {
++          GObject *repository = dup_default ();
++          prepend_library (repository, g_getenv ("MUTTER_NATIVE_TYPELIB_DIR"));
++          prepend_search (repository, g_getenv ("MUTTER_NATIVE_TYPELIB_DIR"));
++          g_object_unref (repository);
++        }
++      g_module_close (module);
++    }
++  privacy_context = context;
++  test_mode = meta_backend_is_headless (backend ()) &&
++              g_strcmp0 (g_getenv ("MUTTER_NATIVE_TAKEOVER_TEST"), "1") == 0;
++  if (meta_backend_is_headless (backend ()) && !test_mode) return;
++  if (test_mode)
++    {
++      const char *startup_ms = g_getenv ("MUTTER_NATIVE_TEST_STARTUP_TIMEOUT_MS");
++      const char *reclaim_ms = g_getenv ("MUTTER_NATIVE_TEST_RECLAIM_TIMEOUT_MS");
++      if (startup_ms) startup_timeout_us = CLAMP (g_ascii_strtoll (startup_ms, NULL, 10), 500, 30000) * 1000;
++      if (reclaim_ms) reclaim_timeout_us = CLAMP (g_ascii_strtoll (reclaim_ms, NULL, 10), 500, 10000) * 1000;
++    }
++  system_bus = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, NULL);
++  if (g_strcmp0 (g_getenv ("MUTTER_NATIVE_GREETER"), "1") == 0)
++    {
++      if (!test_mode)
++        {
++          greeter_session_path = find_greeter_session_with_retry ();
++          if (!greeter_session_path)
++            {
++              g_warning ("[NativeTakeover] Refusing greeter mode: no unique native GDM seat0 session");
++              return;
++            }
++        }
++      greeter_mode = TRUE;
++    }
++  privacy_bus = g_bus_get_sync (G_BUS_TYPE_SESSION, NULL, &error);
++  if (!privacy_bus) { g_warning ("[NativeTakeover] %s", error->message); return; }
++  info = g_dbus_node_info_new_for_xml (xml, NULL);
++  if (!g_dbus_connection_register_object (privacy_bus, "/org/gnome/Mutter/NativeTakeover",
++                                         info->interfaces[0], &vtable, NULL, NULL, &error))
++    { g_warning ("[NativeTakeover] %s", error->message); return; }
++  painted_views = g_hash_table_new_full (g_direct_hash, g_direct_equal, g_object_unref, g_free);
++  presented_views = g_hash_table_new (g_direct_hash, g_direct_equal);
++  g_signal_connect (stage (), "presented", G_CALLBACK (presented), NULL);
++  if (test_mode && greeter_mode)
++    meta_remote_access_controller_inhibit_remote_access (controller ());
++  if (startup_privacy_active ())
++    {
++      meta_remote_access_controller_inhibit_remote_access (controller ());
++      remote_inhibited = TRUE;
++    }
++  g_atomic_int_set (&enabled, 1);
++  g_bus_own_name_on_connection (privacy_bus, "org.gnome.Mutter.NativeTakeover",
++                               G_BUS_NAME_OWNER_FLAGS_DO_NOT_QUEUE, NULL, NULL, NULL, NULL);
++  g_message ("[NativeTakeover] Ready on existing native desktop%s", test_mode ? " (ISOLATED TEST)" : "");
++}
+--- /dev/null
++++ b/src/backends/meta-native-local-lock.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#pragma once
++#include "clutter/clutter.h"
++#include <xkbcommon/xkbcommon.h>
++
++void meta_native_local_lock_begin (ClutterActor *stage, struct xkb_keymap *keymap,
++                                   xkb_layout_index_t group, gboolean caps_lock,
++                                   gboolean num_lock, gboolean test_mode,
++                                   void (*verified) (void));
++void meta_native_local_lock_end (void);
++void meta_native_local_lock_set_recovery (gboolean recovery);
++void meta_native_local_lock_key (guint key, gboolean down, gboolean fresh);
++void meta_native_local_lock_paint (ClutterStageView *view);
+--- /dev/null
++++ b/src/backends/meta-native-local-lock.c
+@@ -0,0 +1,268 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later
++ * A physical-output-only authentication surface. Never a scene actor, never
++ * captured by PipeWire. Only fresh raw libinput keys enter its private keymap.
++ */
++#include "config.h"
++#include "backends/meta-native-local-lock.h"
++#include <cairo.h>
++#include <pango/pangocairo.h>
++#include <linux/input-event-codes.h>
++#include <string.h>
++#include <sys/mman.h>
++
++static ClutterActor *local_stage;
++static struct xkb_state *key_state;
++static void (*on_verified) (void);
++static gboolean running, busy, dirty, isolated_test;
++static gboolean recovery_mode;
++static guint generation, ticker;
++static gint64 retry_after;
++static char password[1024];
++static const char *status_text;
++static CoglTexture *texture;
++static GSubprocess *authentication;
++static guint held[KEY_CNT];
++
++static void redraw (void)
++{
++  dirty = TRUE;
++  if (local_stage) clutter_actor_queue_redraw (local_stage);
++}
++
++static gboolean tick (gpointer unused)
++{
++  if (!running) { ticker = 0; return G_SOURCE_REMOVE; }
++  redraw ();
++  return G_SOURCE_CONTINUE;
++}
++
++static void clear_password (void) { explicit_bzero (password, sizeof password); }
++
++void meta_native_local_lock_end (void)
++{
++  running = FALSE;
++  generation++;
++  if (authentication) g_subprocess_force_exit (authentication);
++  g_clear_object (&authentication);
++  if (ticker) { g_source_remove (ticker); ticker = 0; }
++  g_clear_object (&texture);
++  if (key_state) { xkb_state_unref (key_state); key_state = NULL; }
++  memset (held, 0, sizeof held);
++  clear_password ();
++  local_stage = NULL;
++  on_verified = NULL;
++  busy = FALSE;
++}
++
++void meta_native_local_lock_begin (ClutterActor *stage, struct xkb_keymap *keymap,
++                                   xkb_layout_index_t group, gboolean caps_lock,
++                                   gboolean num_lock, gboolean test_mode,
++                                   void (*verified) (void))
++{
++  meta_native_local_lock_end ();
++  local_stage = stage;
++  key_state = xkb_state_new (keymap);
++  xkb_mod_mask_t locked = 0;
++  xkb_mod_index_t caps = xkb_keymap_mod_get_index (keymap, XKB_MOD_NAME_CAPS);
++  xkb_mod_index_t num = xkb_keymap_mod_get_index (keymap, XKB_MOD_NAME_NUM);
++  if (caps_lock && caps != XKB_MOD_INVALID) locked |= 1u << caps;
++  if (num_lock && num != XKB_MOD_INVALID) locked |= 1u << num;
++  xkb_state_update_mask (key_state, 0, 0, locked, 0, 0, group);
++  on_verified = verified;
++  isolated_test = test_mode;
++  running = TRUE;
++  recovery_mode = FALSE;
++  retry_after = 0;
++  status_text = "输入本机密码，按 Enter 接回桌面";
++  (void) mlock (password, sizeof password);
++  ticker = g_timeout_add_seconds (10, tick, NULL);
++  redraw ();
++}
++
++void meta_native_local_lock_set_recovery (gboolean recovery)
++{
++  if (recovery_mode == recovery) return;
++  recovery_mode = recovery;
++  redraw ();
++}
++
++typedef struct { guint generation; } AuthAttempt;
++
++static void auth_done (GObject *source, GAsyncResult *result, gpointer data)
++{
++  AuthAttempt *attempt = data;
++  gboolean ok = g_subprocess_wait_finish (G_SUBPROCESS (source), result, NULL) &&
++                g_subprocess_get_successful (G_SUBPROCESS (source));
++  if (running && attempt->generation == generation &&
++      authentication == G_SUBPROCESS (source))
++    {
++      g_clear_object (&authentication);
++      busy = FALSE;
++      if (ok)
++        {
++          status_text = "验证成功，正在接回桌面…";
++          redraw ();
++          if (on_verified) on_verified ();
++        }
++      else
++        {
++          retry_after = g_get_monotonic_time () + 2 * G_USEC_PER_SEC;
++          status_text = "密码错误或认证不可用，请稍后重试";
++          redraw ();
++        }
++    }
++  g_free (attempt);
++}
++
++static void submit (void)
++{
++  const char *helper = g_getenv ("MUTTER_NATIVE_LOCAL_AUTH_HELPER");
++  if (busy || !*password || g_get_monotonic_time () < retry_after) return;
++  if (isolated_test && g_getenv ("MUTTER_NATIVE_TEST_AUTH_HELPER"))
++    helper = g_getenv ("MUTTER_NATIVE_TEST_AUTH_HELPER");
++  if (!helper || !g_path_is_absolute (helper))
++    {
++      clear_password ();
++      status_text = "认证服务未就绪，请从远程端断开连接";
++      redraw ();
++      return;
++    }
++  authentication = g_subprocess_new (G_SUBPROCESS_FLAGS_STDIN_PIPE |
++                                      G_SUBPROCESS_FLAGS_STDOUT_SILENCE |
++                                      G_SUBPROCESS_FLAGS_STDERR_SILENCE,
++                                      NULL, helper, NULL);
++  if (!authentication)
++    {
++      clear_password ();
++      status_text = "认证服务无法启动，请从远程端断开连接";
++      redraw ();
++      return;
++    }
++  /* At most 1023 bytes: fits in the private pipe without waiting on PAM. */
++  GOutputStream *input = g_subprocess_get_stdin_pipe (authentication);
++  gboolean sent = g_output_stream_write_all (input, password, strlen (password), NULL, NULL, NULL);
++  g_output_stream_close (input, NULL, NULL);
++  clear_password ();
++  if (!sent) g_subprocess_force_exit (authentication);
++  busy = TRUE;
++  status_text = "正在验证本机密码…";
++  AuthAttempt *attempt = g_new0 (AuthAttempt, 1);
++  attempt->generation = generation;
++  g_subprocess_wait_async (authentication, NULL, auth_done, attempt);
++  redraw ();
++}
++
++void meta_native_local_lock_key (guint key, gboolean down, gboolean fresh)
++{
++  if (!running || !key_state || key >= KEY_CNT || !fresh) return;
++  if (down) held[key]++;
++  else if (held[key]) held[key]--;
++  else return;
++  if (held[key] > 1 || (!down && held[key])) return;
++  xkb_state_update_key (key_state, key + 8, down ? XKB_KEY_DOWN : XKB_KEY_UP);
++  if (!down || busy) return;
++  xkb_keysym_t sym = xkb_state_key_get_one_sym (key_state, key + 8);
++  if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) { submit (); return; }
++  if (sym == XKB_KEY_Escape) clear_password ();
++  else if (sym == XKB_KEY_BackSpace)
++    {
++      char *last = g_utf8_find_prev_char (password, password + strlen (password));
++      if (last) explicit_bzero (last, strlen (last));
++    }
++  else if (!xkb_state_mod_name_is_active (key_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) &&
++           !xkb_state_mod_name_is_active (key_state, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE))
++    {
++      char text[64] = {0};
++      int length = xkb_state_key_get_utf8 (key_state, key + 8, text, sizeof text);
++      if (length > 0 && length < sizeof text &&
++          g_unichar_isprint (g_utf8_get_char (text)) &&
++          strlen (password) + length < sizeof password - 1)
++        strcat (password, text);
++      explicit_bzero (text, sizeof text);
++    }
++  redraw ();
++}
++
++static void label (cairo_t *cr, const char *text, int size, int y, double alpha)
++{
++  PangoLayout *layout = pango_cairo_create_layout (cr);
++  PangoFontDescription *font = pango_font_description_from_string ("Sans");
++  pango_font_description_set_absolute_size (font, size * PANGO_SCALE);
++  pango_layout_set_font_description (layout, font);
++  pango_layout_set_text (layout, text, -1);
++  pango_layout_set_width (layout, 760 * PANGO_SCALE);
++  pango_layout_set_alignment (layout, PANGO_ALIGN_CENTER);
++  cairo_set_source_rgba (cr, 1, 1, 1, alpha);
++  cairo_move_to (cr, 20, y);
++  pango_cairo_show_layout (cr, layout);
++  pango_font_description_free (font);
++  g_object_unref (layout);
++}
++
++void meta_native_local_lock_paint (ClutterStageView *view)
++{
++  if (!running) return;
++  if (!view) return; /* Offscreen/remote scene must never include this UI. */
++  CoglFramebuffer *fb = clutter_stage_view_get_framebuffer (view);
++  CoglContext *cogl = cogl_framebuffer_get_context (fb);
++  if (dirty || !texture)
++    {
++      cairo_surface_t *surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, 800, 600);
++      cairo_t *cr = cairo_create (surface);
++      cairo_set_source_rgb (cr, .075, .085, .11);
++      cairo_paint (cr);
++      GDateTime *now = g_date_time_new_now_local ();
++      char *clock = g_date_time_format (now, "%H:%M");
++      char *date = g_date_time_format (now, "%Y年%m月%d日");
++      label (cr, clock, 76, 30, 1);
++      label (cr, date, 20, 130, .75);
++      label (cr, g_get_user_name (), 30, 205, 1);
++      label (cr, recovery_mode ? "请验证本机密码以接回桌面" : "远程会话正在使用此电脑", 18, 255, .72);
++      cairo_set_source_rgb (cr, .17, .18, .22);
++      cairo_rectangle (cr, 200, 315, 400, 52);
++      cairo_fill (cr);
++      GString *dots = g_string_new (NULL);
++      for (int i = 0; i < MIN (g_utf8_strlen (password, -1), 24); i++) g_string_append (dots, "●");
++      label (cr, *dots->str ? dots->str : "密码", 19, 326, *dots->str ? 1 : .5);
++      g_string_free (dots, TRUE);
++      label (cr, status_text, 17, 395, .85);
++      if (xkb_state_mod_name_is_active (key_state, XKB_MOD_NAME_CAPS, XKB_STATE_MODS_LOCKED))
++        label (cr, "Caps Lock 已开启", 15, 435, .7);
++      label (cr, recovery_mode ? "桌面和应用将继续保留" : "验证成功后，远程连接将断开", 15, 480, .5);
++      cairo_surface_flush (surface);
++      g_clear_object (&texture);
++      texture = COGL_TEXTURE (cogl_texture_2d_new_from_data (cogl, 800, 600,
++        COGL_PIXEL_FORMAT_BGRA_8888_PRE, cairo_image_surface_get_stride (surface),
++        cairo_image_surface_get_data (surface), NULL));
++      cairo_destroy (cr);
++      cairo_surface_destroy (surface);
++      g_date_time_unref (now);
++      g_free (clock); g_free (date);
++      dirty = FALSE;
++    }
++  if (!texture) return; /* Underlying physical surface remains black. */
++  /* Paint in physical framebuffer pixels, outside the remote stage actor's
++   * allocation, camera and clip. Restore all matrix/viewport state afterwards. */
++  graphene_matrix_t modelview, projection, identity;
++  float viewport[4];
++  int width = cogl_framebuffer_get_width (fb);
++  int height = cogl_framebuffer_get_height (fb);
++  cogl_framebuffer_get_modelview_matrix (fb, &modelview);
++  cogl_framebuffer_get_projection_matrix (fb, &projection);
++  cogl_framebuffer_get_viewport4fv (fb, viewport);
++  graphene_matrix_init_identity (&identity);
++  cogl_framebuffer_set_modelview_matrix (fb, &identity);
++  cogl_framebuffer_set_viewport (fb, 0, 0, width, height);
++  cogl_framebuffer_orthographic (fb, 0, 0, width, height, -1, 1);
++  float scale = MIN (1.0f, MIN (width / 800.0f, height / 600.0f));
++  float x = (width - 800 * scale) / 2;
++  float y = (height - 600 * scale) / 2;
++  CoglPipeline *pipeline = cogl_pipeline_new (cogl);
++  cogl_pipeline_set_layer_texture (pipeline, 0, texture);
++  cogl_framebuffer_draw_textured_rectangle (fb, pipeline, x, y,
++    x + 800 * scale, y + 600 * scale, 0, 0, 1, 1);
++  g_object_unref (pipeline);
++  cogl_framebuffer_set_modelview_matrix (fb, &modelview);
++  cogl_framebuffer_set_projection_matrix (fb, &projection);
++  cogl_framebuffer_set_viewport (fb, viewport[0], viewport[1], viewport[2], viewport[3]);
++}
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -14,6 +14,7 @@
+ 
+ mutter_pkg_deps = [
+   cairo_dep,
++  pangocairo_dep,
+   gio_unix_dep,
+   glib_dep,
+   gsettings_desktop_schemas_dep,
+@@ -255,6 +256,10 @@
+   'backends/meta-settings.c',
+   'backends/meta-settings-private.h',
+   'backends/meta-sprite.c',
++  'backends/meta-native-privacy.c',
++  'backends/meta-native-privacy.h',
++  'backends/meta-native-local-lock.c',
++  'backends/meta-native-local-lock.h',
+   'backends/meta-stage.c',
+   'backends/meta-stage-impl.c',
+   'backends/meta-stage-impl-private.h',
+--- a/src/core/meta-context.c
++++ b/src/core/meta-context.c
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "config.h"
++#include "backends/meta-native-privacy.h"
+ 
+ #include "core/meta-context-private.h"
+ 
+@@ -481,6 +482,7 @@
+   priv->state = META_CONTEXT_STATE_STARTED;
+ 
+   g_signal_emit (context, signals[STARTED], 0);
++  meta_native_privacy_init (context);
+ 
+   return TRUE;
+ }
+--- a/clutter/clutter/clutter-stage-view-private.h
++++ b/clutter/clutter/clutter-stage-view-private.h
+@@ -73,6 +73,7 @@
+ CLUTTER_EXPORT
+ void clutter_stage_view_notify_ready (ClutterStageView *view);
+ 
++CLUTTER_EXPORT
+ void clutter_stage_view_invalidate_input_devices (ClutterStageView *view);
+ 
+ CLUTTER_EXPORT
+--- a/src/backends/meta-stage.c
++++ b/src/backends/meta-stage.c
+@@ -19,12 +19,14 @@
+  */
+ 
+ #include "config.h"
++#include "backends/meta-native-privacy.h"
+ 
+ #include "backends/meta-stage-private.h"
+ 
+ #include "backends/meta-backend-private.h"
+ #include "backends/meta-cursor-tracker-private.h"
+ #include "clutter/clutter-mutter.h"
++#include "clutter/clutter-stage-view-private.h"
+ #include "meta/meta-backend.h"
+ #include "meta/meta-monitor-manager.h"
+ #include "meta/util.h"
+@@ -253,6 +255,11 @@
+ {
+   MetaStage *meta_stage = META_STAGE (stage);
+ 
++  /* The physical authentication surface is independent of remote scene
++   * damage. Clear/draw the whole physical output, not the app's damage clip. */
++  if (meta_native_privacy_active ())
++    clutter_stage_view_add_redraw_clip (view, NULL);
++
+   notify_watchers_for_mode (meta_stage, view, NULL, frame,
+                             META_STAGE_WATCH_BEFORE_PAINT);
+ }
+@@ -277,7 +284,21 @@
+   ClutterFrame *frame;
+   const MtkRegion *redraw_clip;
+ 
+-  CLUTTER_ACTOR_CLASS (meta_stage_parent_class)->paint (actor, paint_context);
++  gboolean physical_private;
++
++  /* Offscreen PipeWire repaint has no stage view and sees the original scene.
++   * Never attach an actor overlay: that would also blacken remote capture. */
++  physical_private = meta_native_privacy_active () &&
++                     clutter_paint_context_get_stage_view (paint_context) != NULL;
++  if (physical_private)
++    {
++      cogl_framebuffer_clear4f (clutter_paint_context_get_framebuffer (paint_context),
++                                COGL_BUFFER_BIT_COLOR, 0, 0, 0, 1);
++      meta_native_privacy_painted (clutter_paint_context_get_stage_view (paint_context),
++                                   clutter_paint_context_get_frame (paint_context));
++    }
++  else
++    CLUTTER_ACTOR_CLASS (meta_stage_parent_class)->paint (actor, paint_context);
+ 
+   frame = clutter_paint_context_get_frame (paint_context);
+   view = clutter_paint_context_get_stage_view (paint_context);
+@@ -288,7 +309,8 @@
+                                 META_STAGE_WATCH_AFTER_ACTOR_PAINT);
+     }
+ 
+-  g_list_foreach (stage->overlays, (GFunc) meta_overlay_paint, paint_context);
++  if (!physical_private)
++    g_list_foreach (stage->overlays, (GFunc) meta_overlay_paint, paint_context);
+ 
+   if (view)
+     {
+@@ -308,6 +330,19 @@
+   CLUTTER_STAGE_CLASS (meta_stage_parent_class)->paint_view (stage, view,
+                                                              redraw_clip,
+                                                              frame);
++
++  /* The stage actor clips to the remote desktop allocation. Draw the
++   * physical login surface after that clip has been popped, so a smaller
++   * remote desktop cannot crop a larger local monitor's password UI. */
++  if (meta_native_privacy_active ())
++    {
++      cogl_framebuffer_clear4f (clutter_stage_view_get_framebuffer (view),
++                                COGL_BUFFER_BIT_COLOR, 0, 0, 0, 1);
++      meta_native_privacy_paint_local (view);
++      /* The offscreen desktop can add popups without painting the physical
++       * actor tree. Invalidate hit testing for the newly painted scene. */
++      clutter_stage_view_invalidate_input_devices (view);
++    }
+ 
+   notify_watchers_for_mode (meta_stage, view, redraw_clip, frame,
+                             META_STAGE_WATCH_AFTER_PAINT);
+--- a/src/backends/native/meta-seat-impl.c
++++ b/src/backends/native/meta-seat-impl.c
+@@ -26,6 +26,7 @@
+  */
+ 
+ #include "config.h"
++#include "backends/meta-native-privacy.h"
+ 
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -2398,7 +2399,7 @@
+         key_state = libinput_event_keyboard_get_key_state (key_event) ==
+                     LIBINPUT_KEY_STATE_PRESSED;
+         seat_key_count =
+-          libinput_event_keyboard_get_seat_key_count (key_event);
++          meta_native_privacy_key_count (key, libinput_event_keyboard_get_seat_key_count (key_event));
+ 
+         /* Ignore key events that are not seat wide state changes. */
+         if ((key_state == LIBINPUT_KEY_STATE_PRESSED &&
+@@ -2491,7 +2492,7 @@
+         button_state = libinput_event_pointer_get_button_state (button_event) ==
+                        LIBINPUT_BUTTON_STATE_PRESSED;
+         seat_button_count =
+-          libinput_event_pointer_get_seat_button_count (button_event);
++          meta_native_privacy_key_count (button, libinput_event_pointer_get_seat_button_count (button_event));
+ 
+         /* Ignore button events that are not seat wide state changes. */
+         if ((button_state == LIBINPUT_BUTTON_STATE_PRESSED &&
+@@ -2921,6 +2922,10 @@
+ process_event (MetaSeatImpl          *seat_impl,
+                struct libinput_event *event)
+ {
++  /* Observe device removal as well, to release tracked physical holds. */
++  if (meta_native_privacy_filter_input (event))
++    return;
++
+   if (process_base_event (seat_impl, event))
+     return;
+   if (process_device_event (seat_impl, event))
+--- a/src/core/events.c
++++ b/src/core/events.c
+@@ -37,6 +37,8 @@
+ 
+ #ifdef HAVE_NATIVE_BACKEND
+ #include "backends/native/meta-backend-native.h"
++#include "backends/native/meta-input-thread.h"
++#include "backends/meta-native-privacy.h"
+ #endif
+ 
+ #define IS_KEY_EVENT(et) ((et) == CLUTTER_KEY_PRESS || \
+@@ -147,6 +149,16 @@
+ 
+   event_type = clutter_event_type (event);
+ 
++#ifdef HAVE_NATIVE_BACKEND
++  /* Also discard physical events queued just before the privacy transition.
++   * Raw libinput suppression prevents modifier/repeat state changes. */
++  source_device = clutter_event_get_source_device (event);
++  if (meta_native_privacy_active () && !meta_native_privacy_is_cleanup_event (event) && source_device &&
++      META_IS_INPUT_DEVICE_NATIVE (source_device) &&
++      meta_input_device_native_get_libinput_device (source_device))
++    return CLUTTER_EVENT_STOP;
++#endif
++
+   if (meta_display_process_captured_input (display, event))
+     return CLUTTER_EVENT_STOP;
+ 
+--- a/clutter/clutter/clutter-stage-private.h
++++ b/clutter/clutter/clutter-stage-private.h
+@@ -140,6 +140,9 @@
+                                                       gpointer             user_data,
+                                                       GDestroyNotify       user_data_destroy);
+ 
++CLUTTER_EXPORT
++void clutter_stage_set_offscreen_picking (ClutterStage *stage, gboolean enabled);
++
+ void clutter_stage_invalidate_devices (ClutterStage *stage);
+ 
+ GPtrArray * clutter_stage_get_active_gestures_array (ClutterStage *self);
+--- a/clutter/clutter/clutter-stage.c
++++ b/clutter/clutter/clutter-stage.c
+@@ -110,6 +110,7 @@
+   int update_freeze_count;
+ 
+   gboolean update_scheduled;
++  gboolean offscreen_picking;
+ 
+   GPtrArray *all_active_gestures;
+ 
+@@ -909,6 +910,14 @@
+ }
+ 
+ void
++clutter_stage_set_offscreen_picking (ClutterStage *stage, gboolean enabled)
++{
++  ClutterStagePrivate *priv = clutter_stage_get_instance_private (stage);
++  priv->offscreen_picking = enabled;
++  clutter_stage_invalidate_devices (stage);
++}
++
++void
+ clutter_stage_invalidate_devices (ClutterStage *stage)
+ {
+   GList *l;
+@@ -1154,7 +1163,7 @@
+     return actor;
+ 
+   view = clutter_stage_get_view_at (stage, x, y);
+-  if (view)
++  if (view || priv->offscreen_picking)
+     return _clutter_stage_do_pick_on_view (stage, x, y, mode, view, clear_area);
+ 
+   return actor;
+@@ -3570,7 +3579,10 @@
+   pointer_view = clutter_stage_get_view_at (stage,
+                                             coords.x,
+                                             coords.y);
+-  if (pointer_view && pointer_view == view)
++  ClutterStagePrivate *priv = clutter_stage_get_instance_private (stage);
++  if ((pointer_view && pointer_view == view) ||
++      (!pointer_view && priv->offscreen_picking &&
++       view == clutter_stage_peek_stage_views (stage)->data))
+     {
+       clutter_stage_pick_and_update_sprite (stage,
+                                             sprite,
+--- a/src/backends/meta-monitor-config-manager.h
++++ b/src/backends/meta-monitor-config-manager.h
+@@ -45,6 +45,8 @@
+   float scale;
+   gboolean is_primary;
+   gboolean is_presentation;
++  gboolean native_takeover_viewport;
++  guint native_viewport_width, native_viewport_height;
+ } MetaLogicalMonitorConfig;
+ 
+ typedef struct _MetaMonitorsConfigKey
+--- a/src/backends/meta-monitor-config-manager.c
++++ b/src/backends/meta-monitor-config-manager.c
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include "config.h"
++#include "backends/meta-native-privacy.h"
+ 
+ #include "backends/meta-monitor-config-manager.h"
+ 
+@@ -1817,6 +1818,28 @@
+       return FALSE;
+     }
+ 
++  if (logical_monitor_config->native_takeover_viewport)
++    {
++      if (!meta_native_privacy_has_lease () ||
++          logical_monitor_config->layout.x != 0 ||
++          logical_monitor_config->layout.y != 0 ||
++          logical_monitor_config->native_viewport_width < 200 ||
++          logical_monitor_config->native_viewport_width > 8192 ||
++          logical_monitor_config->native_viewport_height < 200 ||
++          logical_monitor_config->native_viewport_height > 8192 ||
++          !isfinite (scale) || scale < 1.0f || scale > 2.0f ||
++          floorf (scale * 4) != scale * 4 ||
++          logical_monitor_config->transform != 0 ||
++          !logical_monitor_config->is_primary)
++        {
++          g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
++                       "Invalid or unprotected native remote viewport");
++          return FALSE;
++        }
++      /* Every physical mode/connector is still checked for applicability. */
++      return TRUE;
++    }
++
+   first_monitor_config = logical_monitor_config->monitor_configs->data;
+   mode_width = first_monitor_config->mode_spec->width;
+   mode_height = first_monitor_config->mode_spec->height;
+--- a/src/backends/meta-monitor-config-store.c
++++ b/src/backends/meta-monitor-config-store.c
+@@ -2610,6 +2610,11 @@
+ meta_monitor_config_store_add (MetaMonitorConfigStore *config_store,
+                                MetaMonitorsConfig     *config)
+ {
++  /* A remote viewport is never a persistent physical monitor setup. */
++  for (GList *l = config->logical_monitor_configs; l; l = l->next)
++    if (((MetaLogicalMonitorConfig *) l->data)->native_takeover_viewport)
++      return;
++
+   g_hash_table_replace (config_store->configs,
+                         config->key, g_object_ref (config));
+ 
+--- a/src/backends/meta-screen-cast-monitor-stream.c
++++ b/src/backends/meta-screen-cast-monitor-stream.c
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include "config.h"
++#include "backends/meta-native-privacy.h"
+ 
+ #include "backends/meta-screen-cast-monitor-stream.h"
+ 
+@@ -41,6 +42,7 @@
+ 
+   MetaMonitor *monitor;
+   MetaLogicalMonitor *logical_monitor;
++  int native_pixel_width, native_pixel_height;
+ };
+ 
+ static void meta_eis_viewport_iface_init (MetaEisViewportInterface *eis_viewport_iface);
+@@ -61,12 +63,25 @@
+   if (!new_logical_monitor)
+     return FALSE;
+ 
+-  if (!mtk_rectangle_equal (&new_logical_monitor->rect,
+-                            &monitor_stream->logical_monitor->rect))
++  int width = 0, height = 0;
++  gboolean native_viewport = meta_native_privacy_get_viewport_size (
++    new_logical_monitor, &width, &height);
++  if (native_viewport)
++    {
++      /* Scale changes keep the capture stream/mapping ID. Rebuild only
++       * the EI viewport so input uses the new logical coordinates. */
++      if (width != monitor_stream->native_pixel_width ||
++          height != monitor_stream->native_pixel_height)
++        return FALSE;
++    }
++  else if (!mtk_rectangle_equal (&new_logical_monitor->rect,
++                                 &monitor_stream->logical_monitor->rect))
+     return FALSE;
+ 
+   g_set_object (&monitor_stream->monitor, new_monitor);
+   g_set_object (&monitor_stream->logical_monitor, new_logical_monitor);
++  if (native_viewport)
++    meta_eis_viewport_notify_changed (META_EIS_VIEWPORT (monitor_stream));
+ 
+   return TRUE;
+ }
+@@ -311,6 +326,8 @@
+       g_set_object (&monitor_stream->monitor, g_value_get_object (value));
+       logical_monitor = meta_monitor_get_logical_monitor (monitor_stream->monitor);
+       g_set_object (&monitor_stream->logical_monitor, logical_monitor);
++      meta_native_privacy_get_viewport_size (logical_monitor,
++        &monitor_stream->native_pixel_width, &monitor_stream->native_pixel_height);
+       break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+--- a/src/backends/meta-screen-cast-monitor-stream-src.c
++++ b/src/backends/meta-screen-cast-monitor-stream-src.c
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include "config.h"
++#include "backends/meta-native-privacy.h"
+ 
+ #include "backends/meta-screen-cast-monitor-stream-src.h"
+ 
+@@ -139,6 +140,7 @@
+ 
+   *width = (int) roundf (logical_monitor->rect.width * scale);
+   *height = (int) roundf (logical_monitor->rect.height * scale);
++  meta_native_privacy_get_viewport_size (logical_monitor, width, height);
+   *frame_rate = meta_monitor_mode_get_refresh_rate (mode);
+ 
+   return TRUE;
+@@ -603,6 +605,33 @@
+     }
+ 
+   color_state = meta_screen_cast_stream_src_get_color_state (src);
++
++  int viewport_width, viewport_height;
++  if (meta_native_privacy_get_viewport_size (logical_monitor,
++                                            &viewport_width, &viewport_height))
++    {
++      if (width != viewport_width || height != viewport_height || stride < width * 4)
++        {
++          g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Stale remote capture size");
++          return FALSE;
++        }
++      CoglTexture *texture = COGL_TEXTURE (cogl_texture_2d_new_with_size (
++        clutter_backend_get_cogl_context (meta_backend_get_clutter_backend (backend)),
++        width, height));
++      CoglFramebuffer *fb = COGL_FRAMEBUFFER (cogl_offscreen_new_with_texture (texture));
++      g_object_unref (texture);
++      if (!cogl_framebuffer_allocate (fb, error))
++        { g_object_unref (fb); return FALSE; }
++      clutter_stage_paint_to_framebuffer (stage, fb, &logical_monitor->rect, scale,
++                                          color_state, paint_flags);
++      CoglBitmap *bitmap = cogl_bitmap_new_for_data (cogl_framebuffer_get_context (fb),
++        width, height, COGL_PIXEL_FORMAT_CAIRO_ARGB32_COMPAT, stride, data);
++      gboolean success = cogl_framebuffer_read_pixels_into_bitmap (
++        fb, 0, 0, COGL_READ_PIXELS_COLOR_BUFFER, bitmap);
++      g_object_unref (bitmap);
++      g_object_unref (fb);
++      return success;
++    }
+ 
+   if (!clutter_stage_paint_to_buffer (stage, &logical_monitor->rect, scale,
+                                       data,
