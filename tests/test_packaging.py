@@ -15,6 +15,9 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+SYSTEM_SHELL_UNIT = Path('/usr/lib/systemd/user/org.gnome.Shell@.service')
+SHELL_UNIT_FIXTURE = ('[Unit]\nDescription=GNOME Shell fixture\n'
+                      '[Service]\nExecStart=/usr/bin/gnome-shell --mode=%i\n')
 
 
 class PackageActivation(unittest.TestCase):
@@ -33,6 +36,19 @@ class PackageActivation(unittest.TestCase):
         self.control.ROOT = Path('/opt/ubuntu-native-takeover')
         self.control.LOGIN_CONFIG = self.home / 'login-config.json'
         self.args = argparse.Namespace(username='test-rdp', dry_run=False)
+        # Exercise the real unit parser and generated overrides without
+        # requiring GNOME to be installed on the test host. Other reads still
+        # access the temporary files whose preservation these tests verify.
+        read_text = Path.read_text
+
+        def fixture_read(path, *args, **kwargs):
+            if path == SYSTEM_SHELL_UNIT:
+                return SHELL_UNIT_FIXTURE
+            return read_text(path, *args, **kwargs)
+
+        shell_unit = patch.object(Path, 'read_text', fixture_read)
+        shell_unit.start()
+        self.addCleanup(shell_unit.stop)
 
     def command(self, args, **kwargs):
         if args[0] == 'openssl':
@@ -99,6 +115,8 @@ class PackageActivation(unittest.TestCase):
         self.assertFalse(any('restart' in c.args[0] or 'start' in c.args[0] for c in calls))
         for path in self.control.launch_files():
             self.assertTrue(path.exists())
+        shell_override = self.control.UNITS / 'org.gnome.Shell@ubuntu.service.d/90-native-takeover.conf'
+        self.assertIn(' -- /usr/bin/gnome-shell --mode=%i\n', shell_override.read_text())
         with patch('subprocess.run', side_effect=self.command), contextlib.redirect_stdout(io.StringIO()):
             runpy.run_path(str(ROOT / 'scripts/disable-native.py'), run_name='__main__')
         self.assertTrue(all(not p.exists() for p in self.control.launch_files()))

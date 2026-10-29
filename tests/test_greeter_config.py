@@ -3,6 +3,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -46,8 +47,11 @@ class GreeterConfigTests(unittest.TestCase):
                     'DCONF_PROFILE': 'gdm', 'XDG_DATA_HOME': '/dynamic/data'}
         # Individual permission checks above exercise unprivileged fixtures;
         # this test verifies the public environment-copy and asset-list logic.
-        with patch.object(greeter_config, '_check') as check:
+        with patch.object(greeter_config, '_check') as check, \
+             patch.object(greeter_config.grp, 'getgrnam',
+                          return_value=SimpleNamespace(gr_gid=4242)) as group:
             child = greeter_config.grd_environment(original, config=config, data=data)
+        group.assert_called_once_with('gdm')
         self.assertEqual(original['DCONF_PROFILE'], 'gdm')
         self.assertEqual(child['DCONF_PROFILE'], str(config / 'dconf-profile'))
         self.assertEqual(child['XDG_DATA_HOME'], str(data / 'rdp'))
@@ -58,6 +62,9 @@ class GreeterConfigTests(unittest.TestCase):
         self.assertIn(data / 'tls.key', checked)
         self.assertIn(config / 'settings.db', checked)
         self.assertIn(Path('/'), checked)
+        check.assert_any_call(data / 'tls.key', secret=True, group_gid=4242)
+        check.assert_any_call(data / 'rdp/gnome-remote-desktop/credentials.ini',
+                              secret=True, group_gid=4242)
 
     @unittest.skipUnless(shutil.which('dconf') and shutil.which('gsettings'), 'dconf tools required')
     def test_compiled_file_database_is_read_only_and_does_not_create_user_database(self):
