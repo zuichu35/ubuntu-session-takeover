@@ -75,6 +75,8 @@ takeover_revoked (GSocket      *socket,
   return G_SOURCE_REMOVE;
 }
 
+static void append_native_scale (GString *line, uint32_t scale);
+
 static gboolean
 acquire_takeover (GrdSessionRdp *session_rdp)
 {
@@ -100,10 +102,21 @@ acquire_takeover (GrdSessionRdp *session_rdp)
   if (!connection)
     goto failed;
   g_socket_set_timeout (g_socket_connection_get_socket (connection), 10);
-  if (g_getenv ("GRD_NATIVE_TAKEOVER"))
-    request = g_strdup_printf ("REMOTE %u %u\n",
-      freerdp_settings_get_uint32 (session_rdp->peer->context->settings, FreeRDP_DesktopWidth),
-      freerdp_settings_get_uint32 (session_rdp->peer->context->settings, FreeRDP_DesktopHeight));
+  if (session_rdp->native_layout_request)
+    request = g_steal_pointer (&session_rdp->native_layout_request);
+  else if (g_getenv ("GRD_NATIVE_TAKEOVER"))
+    {
+      rdpSettings *native_settings = session_rdp->peer->context->settings;
+      GString *line = g_string_new (NULL);
+
+      g_string_append_printf (line, "REMOTE %u %u",
+        freerdp_settings_get_uint32 (native_settings, FreeRDP_DesktopWidth),
+        freerdp_settings_get_uint32 (native_settings, FreeRDP_DesktopHeight));
+      append_native_scale (line,
+        freerdp_settings_get_uint32 (native_settings, FreeRDP_DesktopScaleFactor));
+      g_string_append_c (line, '\n');
+      request = g_string_free (line, FALSE);
+    }
   else
     request = g_strdup ("REMOTE\n");
   if (!g_output_stream_write_all (g_io_stream_get_output_stream (G_IO_STREAM (connection)),
@@ -125,18 +138,97 @@ failed:
   return FALSE;
 }
 
+/* Remote-only extra monitors beside the native viewport (desktop backend). */
+static gboolean
+native_multimon_enabled (void)
+{
+  return g_getenv ("GRD_NATIVE_TAKEOVER") &&
+         g_strcmp0 (g_getenv ("GRD_NATIVE_MULTIMON"), "1") == 0;
+}
+
+/* The client's desktop scale as a trailing " S<percent>", if it sent one. */
+static void
+append_native_scale (GString  *line,
+                     uint32_t  scale)
+{
+  if (scale >= 100 && scale <= 500)
+    g_string_append_printf (line, " S%u", scale);
+}
+
+/* "VERB w h [x y w h]... [S<percent>]": the primary (viewport) size, then
+ * every other client monitor relative to it, then the client's scale of the
+ * primary monitor. RDP places the primary monitor at 0,0. */
+static char *
+native_layout_line (GrdRdpMonitorConfig *monitor_config,
+                    const char          *verb,
+                    uint32_t             fallback_scale)
+{
+  GString *line = g_string_new (verb);
+  uint32_t scale = fallback_scale;
+  uint32_t i;
+
+  for (i = 0; i < monitor_config->monitor_count; ++i)
+    {
+      GrdRdpVirtualMonitor *monitor = &monitor_config->virtual_monitors[i];
+
+      if (monitor->is_primary)
+        {
+          g_string_append_printf (line, " %u %u", monitor->width, monitor->height);
+          if (monitor->scale)
+            scale = monitor->scale;
+        }
+    }
+  for (i = 0; i < monitor_config->monitor_count; ++i)
+    {
+      GrdRdpVirtualMonitor *monitor = &monitor_config->virtual_monitors[i];
+
+      if (!monitor->is_primary)
+        g_string_append_printf (line, " %d %d %u %u", monitor->pos_x,
+                                monitor->pos_y, monitor->width, monitor->height);
+    }
+  append_native_scale (line, scale);
+  g_string_append_c (line, '\n');
+
+  return g_string_free (line, FALSE);
+}
+
 gboolean
-grd_session_rdp_resize_native (GrdSessionRdp *session_rdp,
-                              uint32_t width,
-                              uint32_t height)
+grd_session_rdp_update_native_layout (GrdSessionRdp       *session_rdp,
+                                      GrdRdpMonitorConfig *monitor_config)
 {
   g_autofree char *request = NULL;
   g_autoptr (GError) error = NULL;
+
+  if (!native_multimon_enabled () || !monitor_config->is_virtual)
+    return FALSE;
+  if (!session_rdp->takeover_connection)
+    return TRUE;
+  request = native_layout_line (monitor_config, "LAYOUT", 0);
+  if (!g_output_stream_write_all (
+        g_io_stream_get_output_stream (G_IO_STREAM (session_rdp->takeover_connection)),
+        request, strlen (request), NULL, NULL, &error))
+    g_warning ("[Takeover] Layout request failed: %s", error->message);
+  return TRUE;
+}
+
+gboolean
+grd_session_rdp_resize_native (GrdSessionRdp *session_rdp,
+                              uint32_t width,
+                              uint32_t height,
+                              uint32_t scale)
+{
+  g_autofree char *request = NULL;
+  g_autoptr (GError) error = NULL;
+  GString *line;
   if (!g_getenv ("GRD_NATIVE_TAKEOVER"))
     return FALSE;
   if (!session_rdp->takeover_connection)
     return TRUE;
-  request = g_strdup_printf ("RESIZE %u %u\n", width, height);
+  line = g_string_new (NULL);
+  g_string_append_printf (line, "RESIZE %u %u", width, height);
+  append_native_scale (line, scale);
+  g_string_append_c (line, '\n');
+  request = g_string_free (line, FALSE);
   if (!g_output_stream_write_all (
         g_io_stream_get_output_stream (G_IO_STREAM (session_rdp->takeover_connection)),
         request, strlen (request), NULL, NULL, &error))
@@ -168,7 +260,7 @@ edit(file, '  freerdp_settings_set_bool (rdp_settings, FreeRDP_NlaSecurity, TRUE
   if (g_getenv ("GRD_NATIVE_TAKEOVER"))
     freerdp_settings_set_bool (rdp_settings, FreeRDP_ExtSecurity, FALSE);''')
 edit(file, '#include <gio/gio.h>', '#include <gio/gio.h>\n#include <gio/gunixsocketaddress.h>')
-edit(file, '  GrdRdpServer *server;', '  GSocketConnection *takeover_connection;\n  GSource *takeover_source;\n\n  GrdRdpServer *server;')
+edit(file, '  GrdRdpServer *server;', '  GSocketConnection *takeover_connection;\n  GSource *takeover_source;\n  char *native_layout_request;\n\n  GrdRdpServer *server;')
 edit(file, 'static void\nnotify_post_connected (gpointer user_data)', code + 'static void\nnotify_post_connected (gpointer user_data)')
 edit(file, '  grd_rdp_session_metrics_notify_phase_completion (session_rdp->session_metrics,\n                                                   GRD_RDP_PHASE_POST_CONNECT);', '''  if (session_rdp->takeover_connection)
     {
@@ -192,7 +284,7 @@ edit(file, '  set_rdp_peer_flag (session_rdp, RDP_PEER_ACTIVATED);', '''  if (!a
     return FALSE;
 
   set_rdp_peer_flag (session_rdp, RDP_PEER_ACTIVATED);''')
-edit(file, '  g_assert (!session_rdp->cursor_renderer);', '  g_assert (!session_rdp->cursor_renderer);\n  release_takeover (session_rdp);')
+edit(file, '  g_assert (!session_rdp->cursor_renderer);', '  g_assert (!session_rdp->cursor_renderer);\n  release_takeover (session_rdp);\n  g_clear_pointer (&session_rdp->native_layout_request, g_free);')
 edit(file, 'grd_session_rdp_init (GrdSessionRdp *session_rdp)\n{', '''grd_session_rdp_init (GrdSessionRdp *session_rdp)
 {
   /* Base stopped signal is emitted after EI and Mutter session teardown. */
@@ -200,17 +292,34 @@ edit(file, 'grd_session_rdp_init (GrdSessionRdp *session_rdp)\n{', '''grd_sessio
 edit(file, '  if (session_rdp->screen_share_mode == GRD_RDP_SCREEN_SHARE_MODE_EXTEND)\n    {\n      rdp_peer_context->display_control =',
      '  if (session_rdp->screen_share_mode == GRD_RDP_SCREEN_SHARE_MODE_EXTEND ||\n      g_getenv ("GRD_NATIVE_TAKEOVER"))\n    {\n      rdp_peer_context->display_control =')
 edit(file, '                                         get_max_monitor_count (session_rdp));',
-     '                                         g_getenv ("GRD_NATIVE_TAKEOVER") ? 1 : get_max_monitor_count (session_rdp));')
+     '                                         g_getenv ("GRD_NATIVE_TAKEOVER") ?\n'
+     '                                           (native_multimon_enabled () ? NATIVE_MAX_MONITOR_COUNT : 1) :\n'
+     '                                           get_max_monitor_count (session_rdp));')
 edit('src/grd-session-rdp.h', 'GSocketConnection *grd_session_rdp_get_socket_connection (GrdSessionRdp *session_rdp);',
-     'GSocketConnection *grd_session_rdp_get_socket_connection (GrdSessionRdp *session_rdp);\n\ngboolean grd_session_rdp_resize_native (GrdSessionRdp *session_rdp, uint32_t width, uint32_t height);')
+     'GSocketConnection *grd_session_rdp_get_socket_connection (GrdSessionRdp *session_rdp);\n\ngboolean grd_session_rdp_resize_native (GrdSessionRdp *session_rdp, uint32_t width, uint32_t height, uint32_t scale);\n\n'
+     'struct _GrdRdpMonitorConfig;\ngboolean grd_session_rdp_update_native_layout (GrdSessionRdp *session_rdp, struct _GrdRdpMonitorConfig *monitor_config);')
 edit('src/grd-rdp-dvc-display-control.c',
      '  grd_rdp_layout_manager_submit_new_monitor_config (layout_manager,\n                                                    monitor_config);',
-     '''  if (grd_session_rdp_resize_native (session_rdp,
-                                     monitor_config->desktop_width,
-                                     monitor_config->desktop_height))
+     '''  if (grd_session_rdp_update_native_layout (session_rdp, monitor_config))
+    monitor_config->native_hybrid = TRUE;
+  else
     {
-      grd_rdp_monitor_config_free (monitor_config);
-      return CHANNEL_RC_OK;
+      uint32_t native_scale = 0;
+      uint32_t native_i;
+
+      for (native_i = 0; native_i < monitor_config->monitor_count; ++native_i)
+        {
+          if (monitor_config->virtual_monitors[native_i].is_primary)
+            native_scale = monitor_config->virtual_monitors[native_i].scale;
+        }
+      if (grd_session_rdp_resize_native (session_rdp,
+                                         monitor_config->desktop_width,
+                                         monitor_config->desktop_height,
+                                         native_scale))
+        {
+          grd_rdp_monitor_config_free (monitor_config);
+          return CHANNEL_RC_OK;
+        }
     }
   grd_rdp_layout_manager_submit_new_monitor_config (layout_manager,
                                                     monitor_config);''')
@@ -229,6 +338,285 @@ edit('src/grd-utils.c', '  if (!negotiate_port)\n    {', """  if (g_strcmp0 (g_g
     }
   if (!negotiate_port)
     {""")
+# Multi-monitor native takeover. The primary client monitor is the physical
+# viewport stream (recreated on every layout change, as upstream does for
+# physical monitors). Every other client monitor is an upstream virtual monitor,
+# which Mutter keeps beside the viewport and never shows on a physical output.
+edit(file, '#define MAX_MONITOR_COUNT_HEADLESS 16', '#define MAX_MONITOR_COUNT_HEADLESS 16\n#define NATIVE_MAX_MONITOR_COUNT 4\n\n'
+     'static gboolean native_multimon_enabled (void);\n'
+     'static char *native_layout_line (GrdRdpMonitorConfig *monitor_config, const char *verb, uint32_t fallback_scale);')
+edit(file, '''  if (session_rdp->screen_share_mode == GRD_RDP_SCREEN_SHARE_MODE_EXTEND)
+    {
+      uint32_t max_monitor_count;
+
+      max_monitor_count = get_max_monitor_count (session_rdp);
+      monitor_config =
+        grd_rdp_monitor_config_new_from_client_data (rdp_settings,
+                                                     max_monitor_count, &error);
+    }''', '''  if (session_rdp->screen_share_mode == GRD_RDP_SCREEN_SHARE_MODE_EXTEND ||
+      native_multimon_enabled ())
+    {
+      uint32_t max_monitor_count;
+
+      max_monitor_count = native_multimon_enabled () ? NATIVE_MAX_MONITOR_COUNT :
+                                                       get_max_monitor_count (session_rdp);
+      monitor_config =
+        grd_rdp_monitor_config_new_from_client_data (rdp_settings,
+                                                     max_monitor_count, &error);
+      if (monitor_config && native_multimon_enabled ())
+        {
+          monitor_config->native_hybrid = TRUE;
+          g_clear_pointer (&session_rdp->native_layout_request, g_free);
+          session_rdp->native_layout_request =
+            native_layout_line (monitor_config, "REMOTE",
+                                freerdp_settings_get_uint32 (rdp_settings,
+                                                             FreeRDP_DesktopScaleFactor));
+        }
+    }''')
+edit(file, '''  if (session_rdp->screen_share_mode == GRD_RDP_SCREEN_SHARE_MODE_EXTEND)
+    {
+      freerdp_settings_set_uint32 (rdp_settings, FreeRDP_DesktopWidth,''',
+     '''  if (session_rdp->screen_share_mode == GRD_RDP_SCREEN_SHARE_MODE_EXTEND ||
+      monitor_config->native_hybrid)
+    {
+      freerdp_settings_set_uint32 (rdp_settings, FreeRDP_DesktopWidth,''')
+edit('src/grd-rdp-monitor-config.h', '''  /* Size of the Desktop (and the Graphics Output Buffer ADM element) */
+  uint32_t desktop_width;
+  uint32_t desktop_height;
+} GrdRdpMonitorConfig;''', '''  /* Size of the Desktop (and the Graphics Output Buffer ADM element) */
+  uint32_t desktop_width;
+  uint32_t desktop_height;
+
+  /* Native takeover: the primary monitor is the physical viewport stream,
+   * every other monitor is virtual. Implies is_virtual. */
+  gboolean native_hybrid;
+} GrdRdpMonitorConfig;''')
+file = 'src/grd-rdp-layout-manager.c'
+edit(file, '''  GrdRdpVirtualMonitor *virtual_monitor;
+  const char *connector;
+''', '''  GrdRdpVirtualMonitor *virtual_monitor;
+  const char *connector;
+
+  /* Hybrid native layout: the connector stream of the primary monitor. */
+  gboolean native_primary;
+  gboolean native_stream_closed;
+  GrdRdpVirtualMonitor native_geometry;
+''')
+edit(file, '''      if (surface_context->connector)
+        g_assert (i == 0);
+
+      if (surface_context->virtual_monitor)
+        write_virtual_monitor_data (surface_context->virtual_monitor, &monitor);
+      if (surface_context->connector)
+        write_connector_data (surface_context->rdp_surface, &monitor);''',
+     '''      if (surface_context->connector && !surface_context->native_primary)
+        g_assert (i == 0);
+
+      if (surface_context->virtual_monitor)
+        write_virtual_monitor_data (surface_context->virtual_monitor, &monitor);
+      if (surface_context->native_primary)
+        write_virtual_monitor_data (&surface_context->native_geometry, &monitor);
+      else if (surface_context->connector)
+        write_connector_data (surface_context->rdp_surface, &monitor);''')
+edit(file, '''  if (surface_context->connector)
+    {
+      GrdRdpRenderer *renderer =''', '''  /* A hybrid desktop layout comes from the client, not the stream size. */
+  if (surface_context->connector && !surface_context->native_primary)
+    {
+      GrdRdpRenderer *renderer =''')
+edit(file, '''  GrdRdpMonitorConfig *monitor_config = layout_manager->current_monitor_config;
+
+  /*
+   * Monitor configs containing physical monitors cannot be mixed in sessions
+   * with monitor configs containing virtual monitors and vice versa.
+   */
+  if (monitor_config->is_virtual)
+    return;''', '''  GrdRdpMonitorConfig *monitor_config = layout_manager->current_monitor_config;
+  SurfaceContext *surface_context = NULL;
+  GHashTableIter iter;
+
+  if (monitor_config->native_hybrid)
+    {
+      /* The broker resizes the viewport asynchronously and Mutter then
+       * closes its stream. Keep a live stream; re-record only a closed one,
+       * so no pending video size can wait for a stream that disappeared. */
+      g_hash_table_iter_init (&iter, layout_manager->surface_table);
+      while (g_hash_table_iter_next (&iter, NULL, (gpointer *) &surface_context))
+        {
+          if (surface_context->connector &&
+              (!surface_context->stream || surface_context->native_stream_closed))
+            g_hash_table_iter_remove (&iter);
+        }
+      return;
+    }
+
+  /*
+   * Monitor configs containing physical monitors cannot be mixed in sessions
+   * with monitor configs containing virtual monitors and vice versa.
+   */
+  if (monitor_config->is_virtual)
+    return;''')
+edit(file, '''  dispose_physical_monitor_streams (layout_manager);
+
+  if (g_hash_table_size (layout_manager->surface_table) <= n_target_surfaces)''',
+     '''  dispose_physical_monitor_streams (layout_manager);
+
+  if (monitor_config->native_hybrid)
+    {
+      /* Never dispose the viewport surface here; keep monitor_count - 1
+       * virtual surfaces. */
+      uint32_t n_virtual = 0;
+
+      g_hash_table_iter_init (&iter, layout_manager->surface_table);
+      while (g_hash_table_iter_next (&iter, NULL, (gpointer *) &surface_context))
+        {
+          if (surface_context->native_primary)
+            continue;
+          if (n_virtual >= monitor_config->monitor_count - 1)
+            g_hash_table_iter_remove (&iter);
+          else
+            n_virtual++;
+        }
+      return;
+    }
+
+  if (g_hash_table_size (layout_manager->surface_table) <= n_target_surfaces)''')
+edit(file, '''  g_hash_table_iter_init (&iter, layout_manager->surface_table);
+  while (g_hash_table_iter_next (&iter, NULL, (gpointer *) &surface_context))
+    {
+      g_autofree GrdRdpSurfaceMapping *surface_mapping = NULL;
+
+      grd_rdp_surface_set_size (surface_context->rdp_surface, 0, 0);
+      g_clear_pointer (&surface_context->virtual_monitor, g_free);
+
+      if (monitor_config->is_virtual)
+        {
+          GrdRdpVirtualMonitor *virtual_monitor;
+          int32_t surface_pos_x;
+          int32_t surface_pos_y;
+
+          virtual_monitor = &monitor_config->virtual_monitors[i++];
+''', '''  SurfaceContext *native_primary_surface = NULL;
+  uint32_t native_slot = 0;
+
+  if (monitor_config->native_hybrid)
+    {
+      /* Prefer the live viewport stream, otherwise a fresh surface. */
+      g_hash_table_iter_init (&iter, layout_manager->surface_table);
+      while (g_hash_table_iter_next (&iter, NULL, (gpointer *) &surface_context))
+        {
+          if (surface_context->native_primary && surface_context->stream)
+            native_primary_surface = surface_context;
+        }
+      g_hash_table_iter_init (&iter, layout_manager->surface_table);
+      while (!native_primary_surface &&
+             g_hash_table_iter_next (&iter, NULL, (gpointer *) &surface_context))
+        {
+          if (!surface_context->stream)
+            native_primary_surface = surface_context;
+        }
+      g_assert (native_primary_surface);
+    }
+
+  g_hash_table_iter_init (&iter, layout_manager->surface_table);
+  while (g_hash_table_iter_next (&iter, NULL, (gpointer *) &surface_context))
+    {
+      g_autofree GrdRdpSurfaceMapping *surface_mapping = NULL;
+
+      /* A kept viewport stream sends no new format; keep its size. */
+      if (surface_context != native_primary_surface || !surface_context->stream)
+        grd_rdp_surface_set_size (surface_context->rdp_surface, 0, 0);
+      g_clear_pointer (&surface_context->virtual_monitor, g_free);
+      if (surface_context == native_primary_surface && !surface_context->stream)
+        surface_context->native_stream_closed = FALSE;
+      surface_context->native_primary = FALSE;
+
+      if (surface_context == native_primary_surface)
+        {
+          uint32_t j;
+
+          for (j = 0; j < monitor_config->monitor_count; ++j)
+            {
+              if (monitor_config->virtual_monitors[j].is_primary)
+                surface_context->native_geometry = monitor_config->virtual_monitors[j];
+            }
+          surface_context->native_primary = TRUE;
+          surface_context->connector = "";
+          surface_context->output_origin_x =
+            surface_context->native_geometry.pos_x - monitor_config->layout_offset_x;
+          surface_context->output_origin_y =
+            surface_context->native_geometry.pos_y - monitor_config->layout_offset_y;
+        }
+      else if (monitor_config->is_virtual)
+        {
+          GrdRdpVirtualMonitor *virtual_monitor;
+          int32_t surface_pos_x;
+          int32_t surface_pos_y;
+
+          do
+            virtual_monitor = &monitor_config->virtual_monitors[i++];
+          while (monitor_config->native_hybrid && virtual_monitor->is_primary);
+          surface_context->connector = NULL;
+''')
+edit(file, '''          surface_context->virtual_monitor =
+            g_memdup2 (virtual_monitor, sizeof (GrdRdpVirtualMonitor));''', '''          surface_context->virtual_monitor =
+            g_memdup2 (virtual_monitor, sizeof (GrdRdpVirtualMonitor));
+          /* The client order of the extra monitors, as sent to the broker. */
+          if (monitor_config->native_hybrid)
+            surface_context->virtual_monitor->native_slot = ++native_slot;''')
+edit(file, '''      if (surface_context->stream)
+        update_stream_params (surface_context, stream_id);''', '''      if (surface_context->stream && surface_context->native_primary)
+        ; /* The broker resizes the viewport; Mutter re-creates its stream. */
+      else if (surface_context->stream)
+        update_stream_params (surface_context, stream_id);''')
+edit(file, '''on_pipewire_stream_closed (GrdRdpPipeWireStream *pipewire_stream,
+                           GrdRdpLayoutManager  *layout_manager)
+{''', '''on_pipewire_stream_closed (GrdRdpPipeWireStream *pipewire_stream,
+                           GrdRdpLayoutManager  *layout_manager)
+{
+  if (layout_manager->state != UPDATE_STATE_FATAL_ERROR)
+    {
+      SurfaceContext *closed_surface =
+        get_surface_context_from_pipewire_stream (layout_manager, pipewire_stream);
+
+      if (closed_surface->native_primary)
+        closed_surface->native_stream_closed = TRUE;
+    }
+''')
+edit('src/grd-rdp-monitor-config.h', '''  uint32_t scale;           /* Valid values are in range of [100, 500] */''',
+     '''  uint32_t scale;           /* Valid values are in range of [100, 500] */
+
+  /* Native takeover: 1-based client order of an extra monitor, else 0. */
+  uint32_t native_slot;''')
+edit('src/grd-rdp-pipewire-stream.c', '  struct spa_dict_item items[1];', '  struct spa_dict_item items[2];\n  char slot_string[16];\n  uint32_t n_items = 1;')
+edit('src/grd-rdp-pipewire-stream.c', '''  items[0] = SPA_DICT_ITEM_INIT ("org.gnome.preferred-scale", scale_string);''',
+     '''  items[0] = SPA_DICT_ITEM_INIT ("org.gnome.preferred-scale", scale_string);
+  /* Mutter treats only tagged virtual monitors as remote-only extras. */
+  if (virtual_monitor->native_slot && g_getenv ("GRD_NATIVE_MULTIMON"))
+    {
+      g_snprintf (slot_string, sizeof slot_string, "%u", virtual_monitor->native_slot - 1);
+      items[n_items++] = SPA_DICT_ITEM_INIT ("org.gnome.native-takeover.remote-slot", slot_string);
+    }''')
+edit('src/grd-rdp-pipewire-stream.c', '&SPA_DICT_INIT (items, G_N_ELEMENTS (items)));', '&SPA_DICT_INIT (items, n_items));')
+edit(file, '''  g_assert (monitor_config);
+  if (!monitor_config->is_virtual)
+    g_assert (monitor_config->monitor_count == 1);''', '''  g_assert (monitor_config);
+  if (!monitor_config->is_virtual)
+    g_assert (monitor_config->monitor_count == 1);
+  if (monitor_config->native_hybrid)
+    g_assert (monitor_config->is_virtual && monitor_config->monitor_count > 0);''')
+
+# Without SupportMonitorLayoutPdu FreeRDP ignores the client's monitor data.
+edit('src/grd-session-rdp.c', '''  use_client_configs = session_rdp->screen_share_mode ==
+                       GRD_RDP_SCREEN_SHARE_MODE_EXTEND;''', '''  use_client_configs = session_rdp->screen_share_mode ==
+                       GRD_RDP_SCREEN_SHARE_MODE_EXTEND ||
+                       native_multimon_enabled ();''')
+
+edit('src/grd-rdp-layout-manager.c', 'static gboolean\nmaybe_invoke_layout_recreation (gpointer user_data)',
+     'static SurfaceContext *get_surface_context_from_pipewire_stream (GrdRdpLayoutManager  *layout_manager,\n'
+     '                                                                 GrdRdpPipeWireStream *pipewire_stream);\n\n'
+     'static gboolean\nmaybe_invoke_layout_recreation (gpointer user_data)')
+
 manifest = ROOT / 'build/grd-patch-hashes.json'
 previous = json.loads(manifest.read_text()) if manifest.exists() else {}
 digest = lambda text: hashlib.sha256(text.encode()).hexdigest()

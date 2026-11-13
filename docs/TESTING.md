@@ -103,7 +103,30 @@ no local development-machine artifacts or journal exports are uploaded. The
 receipt records the exact package tuple and its limitations. A later archive
 update that changes that tuple requires a new profile and another successful
 run; it does not silently broaden support. The CI profile is currently
-`ubuntu-26.04-amd64-gnome-50.1-updates-20261029`.
+`ubuntu-26.04-amd64-gnome-50.1-updates-20261029` upstream; the host branch
+pins `ubuntu-26.04-amd64-gnome-50.1-host-scale-20261113` in
+`scripts/ci-target.py` and adds two scenarios, `multimon` (two client
+monitors) and `scale` (client-announced 125%, scale steps through the broker,
+a foreign `ApplyMonitorsConfig` scale change, and rejection of a foreign
+request that drops or adds a monitor).
+
+To run the same job locally, mount the checkout at
+`/opt/ubuntu-native-takeover` in an image built from `ci/target.Dockerfile`
+(here tagged `ubuntu-native-takeover-target-host-20261110`) (resource paths are compiled
+in) and run as the invoking user:
+
+```sh
+docker run --rm --cap-drop=ALL --security-opt=no-new-privileges \
+  --shm-size=1g --pids-limit=512 -u "$(id -u):$(id -g)" \
+  -e HOME=/opt/ubuntu-native-takeover/build/target-ci-home \
+  -e NATIVE_TEST_HOST_NET_NS="$(readlink /proc/self/ns/net)" \
+  -v "$PWD":/opt/ubuntu-native-takeover -w /opt/ubuntu-native-takeover \
+  ubuntu-native-takeover-target-host-20261110 python3 scripts/ci-target.py
+```
+
+A scenario keeps its state under `build/target-ci/<name>/`; remove that
+directory after changing a scenario's arguments, or a stale monitor
+configuration from the earlier run can fail the new one.
 
 Run status and test acceptance are separate: a workflow file existing in the
 repository is not evidence of a successful build. Check the Actions run for

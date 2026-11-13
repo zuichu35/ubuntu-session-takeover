@@ -9,6 +9,10 @@
 #include "backends/meta-backend-private.h"
 #include "backends/meta-monitor-config-manager.h"
 #include "backends/meta-monitor-manager-private.h"
+#include "backends/meta-monitor-private.h"
+#include "backends/meta-crtc.h"
+#include "backends/meta-output.h"
+#include "backends/meta-renderer-view.h"
 #include "clutter/clutter-mutter.h"
 #include "meta/compositor.h"
 #include "meta/meta-remote-access-controller.h"
@@ -87,6 +91,7 @@ static const char xml[] =
   "<method name='GetStatus'><arg type='a{sv}' direction='out'/></method>"
   "<method name='InspectPhysical'><arg type='u' direction='out'/>"
   "<arg type='b' direction='out'/></method>"
+  "<method name='InspectViews'><arg type='a(bbiiii)' direction='out'/></method>"
   "<method name='PrepareLogin'><arg type='o' direction='in'/></method>"
   "<method name='TestHoldInput'/>"
   "<method name='TestLocalKey'><arg type='u' direction='in'/><arg type='b' direction='in'/></method>"
@@ -127,12 +132,52 @@ meta_native_privacy_get_viewport_size (MetaLogicalMonitor *monitor,
   if (monitor != meta_monitor_manager_get_primary_logical_monitor (manager)) return FALSE;
   MetaMonitorsConfig *config = meta_monitor_config_manager_get_current (
     meta_monitor_manager_get_config_manager (manager));
-  if (!config || !config->logical_monitor_configs) return FALSE;
-  MetaLogicalMonitorConfig *logical = config->logical_monitor_configs->data;
-  if (!logical->native_takeover_viewport) return FALSE;
-  *width = logical->native_viewport_width;
-  *height = logical->native_viewport_height;
-  return TRUE;
+  if (!config) return FALSE;
+  /* The viewport is the primary logical monitor; remote-only virtual
+   * monitors may follow it in the same temporary configuration. */
+  for (GList *l = config->logical_monitor_configs; l; l = l->next)
+    {
+      MetaLogicalMonitorConfig *logical = l->data;
+      if (!logical->native_takeover_viewport) continue;
+      *width = logical->native_viewport_width;
+      *height = logical->native_viewport_height;
+      return TRUE;
+    }
+  return FALSE;
+}
+
+static gboolean
+viewport_is_current (MetaMonitorManager *manager)
+{
+  MetaMonitorsConfig *config = meta_monitor_config_manager_get_current (
+    meta_monitor_manager_get_config_manager (manager));
+  for (GList *l = config ? config->logical_monitor_configs : NULL; l; l = l->next)
+    if (((MetaLogicalMonitorConfig *) l->data)->native_takeover_viewport)
+      return TRUE;
+  return FALSE;
+}
+
+gboolean
+meta_native_privacy_view_is_physical (ClutterStageView *view)
+{
+  /* Fail closed: anything that cannot be proven to be an extra remote-only
+   * monitor is treated as a physical output and receives the barrier. */
+  if (!privacy_context || !META_IS_RENDERER_VIEW (view)) return TRUE;
+  MetaMonitorManager *manager = meta_backend_get_monitor_manager (backend ());
+  if (!viewport_is_current (manager)) return TRUE;
+  MetaCrtc *crtc = meta_renderer_view_get_crtc (META_RENDERER_VIEW (view));
+  const GList *outputs = crtc ? meta_crtc_get_outputs (crtc) : NULL;
+  if (!outputs) return TRUE;
+  for (const GList *l = outputs; l; l = l->next)
+    {
+      MetaMonitor *monitor = meta_output_get_monitor (l->data);
+      /* Physical passengers, and every other output, stay protected. */
+      if (!monitor || !meta_monitor_is_native_remote_only (monitor)) return TRUE;
+      MetaLogicalMonitor *logical = meta_monitor_get_logical_monitor (monitor);
+      if (!logical || logical == meta_monitor_manager_get_primary_logical_monitor (manager))
+        return TRUE;
+    }
+  return FALSE;
 }
 
 static const char * state (void)
@@ -847,8 +892,11 @@ presented (ClutterStage *unused, ClutterStageView *view, ClutterFrameInfo *info,
   g_hash_table_add (presented_views, view);
   views = clutter_stage_peek_stage_views (stage ());
   if (!views) return;
+  /* Remote-only monitors are never painted black and never shown locally;
+   * every physical output must still acknowledge a black frame. */
   for (l = views; l; l = l->next)
-    if (!g_hash_table_contains (presented_views, l->data)) return;
+    if (meta_native_privacy_view_is_physical (l->data) &&
+        !g_hash_table_contains (presented_views, l->data)) return;
   if (timeout_id) { g_source_remove (timeout_id); timeout_id = 0; }
   if (greeter_mode)
     {
@@ -1094,6 +1142,8 @@ method_call (GDBusConnection *connection, const char *sender, const char *path,
       GList *l;
       for (l = clutter_stage_peek_stage_views (stage ()); l; l = l->next)
         {
+          if (!meta_native_privacy_view_is_physical (l->data))
+            continue;
           CoglFramebuffer *fb = clutter_stage_view_get_framebuffer (l->data);
           int w = cogl_framebuffer_get_width (fb), h = cogl_framebuffer_get_height (fb);
           g_autofree guint8 *pixels = g_malloc (w * h * 4);
@@ -1111,6 +1161,28 @@ method_call (GDBusConnection *connection, const char *sender, const char *path,
           n++;
         }
       g_dbus_method_invocation_return_value (invocation, g_variant_new ("(ub)", n, black && n > 0));
+      return;
+    }
+  if (g_str_equal (method, "InspectViews") && test_mode)
+    {
+      GVariantBuilder views;
+      g_variant_builder_init (&views, G_VARIANT_TYPE ("a(bbiiii)"));
+      for (GList *l = clutter_stage_peek_stage_views (stage ()); l; l = l->next)
+        {
+          MtkRectangle layout;
+          CoglFramebuffer *fb = clutter_stage_view_get_framebuffer (l->data);
+          int w = cogl_framebuffer_get_width (fb), h = cogl_framebuffer_get_height (fb);
+          g_autofree guint8 *pixels = g_malloc (w * h * 4);
+          gboolean black = cogl_framebuffer_read_pixels (fb, 0, 0, w, h,
+                                                         COGL_PIXEL_FORMAT_BGRA_8888_PRE, pixels);
+          for (int i = 0; black && i < w * h; i++)
+            if (pixels[i*4] || pixels[i*4+1] || pixels[i*4+2]) black = FALSE;
+          clutter_stage_view_get_layout (l->data, &layout);
+          g_variant_builder_add (&views, "(bbiiii)",
+                                 meta_native_privacy_view_is_physical (l->data), black,
+                                 layout.x, layout.y, layout.width, layout.height);
+        }
+      g_dbus_method_invocation_return_value (invocation, g_variant_new ("(a(bbiiii))", &views));
       return;
     }
   if (g_str_equal (method, "PrepareLogin") && startup_privacy_active ())

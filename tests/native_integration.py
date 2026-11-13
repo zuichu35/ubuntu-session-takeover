@@ -162,14 +162,24 @@ def main():
         return (connection or observer).call_sync(NAME, OBJ, NAME, method, params, None, 0, 8000, None).unpack()
 
     def inspect_local():
-        physical = call('InspectPhysical')
         from PIL import Image
-        with Image.open(ART / 'physical-local-lock.png') as image:
-            # The password field must survive tiny remote app/clock damage.
-            cx, cy = image.width // 2, image.height // 2
-            assert min(image.getpixel((cx - 190, cy + 40))[:3]) > 30, 'physical password field was clipped away'
-            assert min(image.getpixel((cx - 340, cy + 250))[:3]) > 10, 'physical authentication surface was only partially drawn'
-        return physical
+        # Adding or removing a remote-only monitor rebuilds the stage views;
+        # a rebuilt physical view has no pixels until its first (black or
+        # password UI) frame. Wait for that frame, never for longer than 3 s.
+        deadline = time.monotonic() + 3
+        while True:
+            physical = call('InspectPhysical')
+            try:
+                with Image.open(ART / 'physical-local-lock.png') as image:
+                    # The password field must survive tiny remote app/clock damage.
+                    cx, cy = image.width // 2, image.height // 2
+                    assert min(image.getpixel((cx - 190, cy + 40))[:3]) > 30, 'physical password field was clipped away'
+                    assert min(image.getpixel((cx - 340, cy + 250))[:3]) > 10, 'physical authentication surface was only partially drawn'
+                return physical
+            except AssertionError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(.2)
 
     def ready():
         try:
@@ -238,14 +248,20 @@ def main():
     else:
         assert call('InspectPhysical') == (2 if '--two-monitors' in sys.argv else 1, False), 'baseline native output should contain the app'
     fd, out = os.pipe()
-    spawn(['Xvfb', '-displayfd', str(out), '-screen', '0',
-           '3000x1800x24' if '--exact-viewport' in sys.argv else '1400x900x24', '-nolisten', 'tcp'],
+    # -noreset keeps the RandR monitors defined below after their client exits.
+    screens = (['-screen', '0', '2560x720x24', '-noreset'] if '--multimon' in sys.argv else
+               ['-screen', '0', '3000x1800x24' if '--exact-viewport' in sys.argv else '1400x900x24'])
+    spawn(['Xvfb', '-displayfd', str(out), *screens, '-nolisten', 'tcp'],
           env, 'xvfb', pass_fds=(out,))
     os.close(out)
     with os.fdopen(fd) as f:
         display = ':' + f.readline().strip()
     client_env = dict(env, DISPLAY=display, GDK_BACKEND='x11',
         LD_LIBRARY_PATH=str(ROOT / 'vendor/ubuntu-freerdp/root/usr/lib/x86_64-linux-gnu'))
+    if '--multimon' in sys.argv:
+        monitors = subprocess.check_output(['/usr/bin/python3', '-I', str(ROOT / 'tests/x11_monitors.py'), 'split'],
+                                           env=client_env, text=True).strip()
+        assert monitors == '[(0, 0, 1280, 720, 1), (1280, 0, 1280, 720, 0)]', monitors
     gate = RUN / 'native-gate.sock'
     gate.unlink(missing_ok=True)
 
@@ -296,6 +312,8 @@ def main():
         LD_LIBRARY_PATH=str(ROOT / 'vendor/grd-deps/root/usr/lib/x86_64-linux-gnu' if RUNTIME_ROOT == ROOT else RUNTIME_ROOT / 'build/grd-prefix/lib/x86_64-linux-gnu'))
     if '--greeter-probe' in sys.argv:
         grd_env['GRD_NATIVE_GREETER'] = '1'
+    if '--multimon' in sys.argv:
+        grd_env['GRD_NATIVE_MULTIMON'] = '1'
     for schema, name, value in [('org.gnome.desktop.remote-desktop.rdp', 'tls-cert', str(cert)),
                                ('org.gnome.desktop.remote-desktop.rdp', 'tls-key', str(key)),
                                ('org.gnome.desktop.remote-desktop.rdp.headless', 'enable', 'true')]:
@@ -348,10 +366,12 @@ def main():
     def remote(title, pwd=password):
         SYNTHETIC_SECRETS.add(pwd)
         return spawn([os.environ.get('NATIVE_TEST_FREERDP', str(ROOT / 'vendor/ubuntu-freerdp/root/usr/bin/xfreerdp')), '/v:127.0.0.1:43392',
-                      '/u:native-test', '/p:' + pwd, '/cert:ignore', '/size:1280x720', '/gfx:RFX',
+                      '/u:native-test', '/p:' + pwd, '/cert:ignore',
+                      '/multimon' if '--multimon' in sys.argv else '/size:1280x720', '/gfx:RFX',
                       '/network:lan', '/title:' + title] +
                      (['-clipboard'] if os.environ.get('NATIVE_TEST_NO_CLIPBOARD') == '1' else []) +
-                     (['/dynamic-resolution'] if '--adaptive' in sys.argv else []), client_env, title)
+                     (['/dynamic-resolution'] if '--adaptive' in sys.argv else []) +
+                     (['/scale-desktop:125'] if '--remote-scale' in sys.argv else []), client_env, title)
 
     bad = remote('NativeBadPassword', 'invalid-' + secrets.token_urlsafe(8))
     wait_for(lambda: bad.poll() is not None, 'bad password did not fail')
@@ -362,6 +382,17 @@ def main():
             'GetCurrentState', None, None, 0, 3000, None).unpack()[2])
     if '--two-monitors' in sys.argv:
         assert monitor_count() == 2
+
+    def remote_only_layout():
+        state = connect().call_sync('org.gnome.Mutter.DisplayConfig',
+            '/org/gnome/Mutter/DisplayConfig', 'org.gnome.Mutter.DisplayConfig',
+            'GetCurrentState', None, None, 0, 3000, None).unpack()
+        remote_only = {spec[0] for spec, _, p in state[1] if p.get('native-takeover-remote-only')}
+        extra = [m for m in state[2] if m[5] and all(spec[0] in remote_only for spec in m[5])]
+        return state, extra
+
+    def remote_only_views():
+        return [view for view in call('InspectViews')[0] if not view[0]]
     # Simulate hardware that never releases modifiers, consumer keys and a drag.
     # The real seat must be neutral before the remote client can type/click.
     if '--boot-guard' not in sys.argv:
@@ -375,6 +406,8 @@ def main():
         wait_for(lambda: monitor_count() == 1, 'remote layout was not applied')
     if '--greeter-probe' in sys.argv:
         window = harness.wait_for_client_window(first, client_env, 'NativeRDPTest')
+        # The X11 window appears before FreeRDP has finished enabling RDP input.
+        time.sleep(3)
         for command in (['windowfocus',window], ['type','--clearmodifiers','greeter-input-over-rdp']):
             subprocess.run(['xdotool',*command],env=client_env,check=True)
         wait_for(lambda: json.loads(state_file.read_text())['text'] == 'greeter-input-over-rdp', 'Greeter RDP input failed')
@@ -449,17 +482,19 @@ def main():
         return subprocess.check_output(['xdotool', *args], env=client_env, text=True).strip()
     wid = harness.wait_for_client_window(first, client_env, 'NativeRDPTest')
     xd('windowfocus', wid)
+    # The X11 window appears before FreeRDP has finished enabling RDP input.
+    time.sleep(3)
+    if SHELL and '--boot-guard' in sys.argv:
+        # GNOME Shell presents Overview after the startup guard unlocks. Close
+        # it through the RDP keyboard path before checking delivery to an app.
+        xd('key', 'Escape')
+        time.sleep(1)
     xd('type', '--clearmodifiers', '--delay', '60', 'native-original-session-123')
     from PIL import ImageGrab
     ImageGrab.grab(xdisplay=display).save(ART / 'rdp-original.png')
     wait_for(lambda: json.loads(state_file.read_text())['text'] == 'native-original-session-123',
              'RDP input did not reach original application')
     assert json.loads(state_file.read_text())['pid'] == app.pid
-    if SHELL and '--boot-guard' in sys.argv:
-        # The startup Overview can return after the first unlock. The initial
-        # client key may precede input setup; do this after verified typing.
-        xd('key', 'Super_L')
-        time.sleep(1)
     xd('mousemove', '--window', wid, '450', '380')
     time.sleep(.3)
     xd('mousemove_relative', '--', '1', '0')
@@ -473,6 +508,52 @@ def main():
     xd('mouseup', '1')
     wait_for(lambda: json.loads(state_file.read_text())['clicks'] == 1, 'RDP mouse did not reach original application')
     assert inspect_local() == (2 if '--two-monitors' in sys.argv else 1, False), 'physical authentication UI disappeared'
+    multimon_result = {}
+    if '--multimon' in sys.argv:
+        # The second client monitor is a remote-only virtual monitor at the
+        # client's position, beside the viewport that holds the physical output.
+        try:
+            wait_for(lambda: len(remote_only_layout()[1]) == 1, 'second client monitor was not added', 15)
+        except AssertionError:
+            raise AssertionError('second client monitor was not added: ' + repr(remote_only_layout()[0]))
+        state, extra = remote_only_layout()
+        primary = next(m for m in state[2] if m[4])
+        assert (primary[0], primary[1]) == (0, 0) and (extra[0][0], extra[0][1]) == (1280, 0), state[2]
+        assert [tuple(e) for e in state[3]['native-takeover-extra']] == [(1280, 0, 1280, 720)], state[3]
+        assert tuple(state[3]['native-takeover-size']) == (1280, 720)
+        views = call('InspectViews')[0]
+        physical = [view for view in views if view[0]]
+        assert len(physical) == (2 if '--two-monitors' in sys.argv else 1), views
+        assert len(remote_only_views()) == 1, views
+        wait_for(lambda: not remote_only_views()[0][1], 'remote-only monitor was blackened like a physical output')
+        assert inspect_local() == (2 if '--two-monitors' in sys.argv else 1, False), \
+            'physical output changed when a remote-only monitor was added'
+        # Move the original application onto the extra monitor and click it there.
+        presses = lambda: (ART / 'app.log').read_text().count('press 1')
+        before_presses = presses()
+        xd('key', 'super+shift+Right')
+        time.sleep(1.5)
+        ImageGrab.grab(xdisplay=display).save(ART / 'rdp-multimon.png')
+        xd('mousemove', '1680', '250')
+        time.sleep(.3)
+        xd('mousemove_relative', '--', '1', '0')
+        time.sleep(.3)
+        xd('click', '1')
+        wait_for(lambda: presses() > before_presses, 'RDP input on the second monitor did not reach the moved window')
+        grab = ImageGrab.grab(xdisplay=display)
+        right = grab.crop((1280, 0, 2560, 720)).convert('L')
+        assert right.getextrema() != (0, 0), 'second client monitor received no picture'
+        assert grab.crop((0, 0, 1280, 720)).convert('L').getextrema() != (0, 0), \
+            'viewport picture stopped when the remote-only monitor was added'
+        assert inspect_local() == (2 if '--two-monitors' in sys.argv else 1, False), \
+            'physical output showed remote content'
+        xd('key', 'super+shift+Left')
+        time.sleep(1)
+        multimon_result = {'viewport_and_extra_monitor_both_painted': True,
+                           'remote_only_monitor_at_client_position': True,
+                           'remote_only_monitor_not_blackened': True,
+                           'physical_views_unchanged_with_extra_monitor': True,
+                           'rdp_input_on_extra_monitor': True}
     def local_key(key):
         call('TestLocalKey', GLib.Variant('(ub)', (key, True)))
         call('TestLocalKey', GLib.Variant('(ub)', (key, False)))
@@ -513,7 +594,11 @@ def main():
                                             for s, modes, _ in state[1]}
             assert hardware_modes(current) == hardware_modes(initial_monitor_state), 'Remote resize changed a physical hardware mode'
             if '--remote-scale' in sys.argv:
-                for percent in [125, 175, 200, 150]:
+                # The saved setting is 100%; only the client announced 125%.
+                assert '"scale_percent": 125' in (ART / 'broker.log').read_text(), \
+                    'The scale announced by the RDP client was not used'
+                assert viewport_layout.state()[2][0][2] == 1.25
+                for percent in [175, 200, 125]:
                     with socket.socket(socket.AF_UNIX) as control:
                         control.settimeout(8)
                         control.connect(str(gate))
@@ -524,6 +609,39 @@ def main():
                     assert scaled[2][0][2] == percent / 100
                     assert tuple(scaled[3]['native-takeover-size']) == (2560, 1440)
                     assert first.poll() is None, 'Scale change disconnected the RDP client'
+                # GNOME Settings knows nothing about the viewport. Its
+                # persistent request with a scale of the physical mode must
+                # become a scale change of the remote desktop, not a
+                # physical layout under a capture stream of another size.
+                foreign = snapshot(viewport_layout.state())
+                foreign['properties'] = {k: v for k, v in foreign['properties'].items() if k == 'layout-mode'}
+                foreign['logical'][0][2] = 1.4953271
+                viewport_layout.apply(viewport_layout.state(), foreign, method=2)
+                scaled = viewport_layout.state()
+                assert scaled[2][0][2] == 1.5, scaled[2]
+                assert tuple(scaled[3]['native-takeover-size']) == (2560, 1440)
+                assert hardware_modes(scaled) == hardware_modes(initial_monitor_state)
+                # Anything but the scale is refused. Here the request drops a
+                # physical monitor, as disabling it in the panel would.
+                if len(foreign['logical'][0][5]) > 1:
+                    fewer = json.loads(json.dumps(foreign))
+                    fewer['logical'][0][5] = fewer['logical'][0][5][:1]
+                    try:
+                        viewport_layout.apply(viewport_layout.state(), fewer, method=2)
+                    except GLib.Error:
+                        pass
+                    else:
+                        raise AssertionError('A display settings request changed the physical monitors')
+                    assert snapshot(viewport_layout.state())['logical'] == snapshot(scaled)['logical']
+                foreign['logical'].append([4000, 0, 1.0, 0, False, foreign['logical'][0][5]])
+                try:
+                    viewport_layout.apply(viewport_layout.state(), foreign, method=2)
+                except GLib.Error:
+                    pass
+                else:
+                    raise AssertionError('A foreign physical layout replaced the remote viewport')
+                assert first.poll() is None and call('GetState') == ('remote',), \
+                    'Display settings request ended the remote session'
             viewport_control.touch()
             time.sleep(3)
             before = ImageGrab.grab(xdisplay=display)
@@ -542,7 +660,7 @@ def main():
                         'org.kde.impanel2', method, args, None, 0, 5000, None).unpack()
                 panel('SetRelativeSpotRectV2', GLib.Variant('(iiiid)', (500, 160, 2, 30, 1.5)))
                 panel('SetLookupTable', GLib.Variant('(asasasbbii)',
-                    (['1.', '2.'], ['测试候选一', '测试候选二'], ['', ''], False, False, 0, 0)))
+                    (['1.', '2.'], ['test candidate one', 'test candidate two'], ['', ''], False, False, 0, 0)))
                 observer.emit_signal(None, '/org/kde/impanel', 'org.kde.kimpanel.inputmethod',
                                      'ShowLookupTable', GLib.Variant('(b)', (True,)))
                 time.sleep(1)
@@ -612,6 +730,10 @@ def main():
     local_key(28)
     wait_for(lambda: call('GetState') == ('local',), 'valid local authentication did not reclaim')
     wait_for(lambda: first.poll() is not None, 'local reclaim left remote connected')
+    if '--multimon' in sys.argv:
+        wait_for(lambda: not remote_only_layout()[1] and not remote_only_views(),
+                 'local reclaim left a remote-only monitor', 15)
+        multimon_result['local_reclaim_removes_extra_monitor'] = True
     saver_active = connect().call_sync('org.gnome.ScreenSaver', '/org/gnome/ScreenSaver',
         'org.gnome.ScreenSaver', 'GetActive', None, None, 0, 3000, None).unpack()[0]
     assert not saver_active, 'local reclaim asked for a second password'
@@ -632,8 +754,13 @@ def main():
     if '--two-monitors' in sys.argv:
         wait_for(lambda: monitor_count() == 2, 'disconnect did not restore both monitors')
     assert app.poll() is None and json.loads(state_file.read_text())['text'] == 'native-original-session-123'
+    if '--multimon' in sys.argv:
+        wait_for(lambda: not remote_only_layout()[1], 'disconnect left a remote-only monitor', 15)
     second = remote('NativeReconnect')
     wait_for(lambda: call('GetState') == ('remote',), 'reconnect failed', 20)
+    if '--multimon' in sys.argv:
+        wait_for(lambda: len(remote_only_layout()[1]) == 1, 'reconnect did not restore the second monitor', 15)
+        multimon_result['reconnect_restores_extra_monitor'] = True
     if '--two-monitors' in sys.argv:
         wait_for(lambda: monitor_count() == 1, 'reconnected layout was not applied')
     assert inspect_local() == (2 if '--two-monitors' in sys.argv else 1, False)
@@ -700,6 +827,8 @@ def main():
     result['remote_scale_switching_verified'] = '--remote-scale' in sys.argv
     result['local_scale_restoration_verified'] = '--exact-viewport' in sys.argv and '--two-monitors' in sys.argv
     result['input_method_panel_verified'] = '--ime' in sys.argv
+    result['multi_monitor_verified'] = bool(multimon_result)
+    result.update(multimon_result)
     result['tested_binaries'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in
         [lib / 'libmutter-18.so.0', RUNTIME_ROOT / 'build/grd-prefix/libexec/gnome-remote-desktop-daemon']}
     result['loaded_files'] = loaded_files

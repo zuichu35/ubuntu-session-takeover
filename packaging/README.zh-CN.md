@@ -1,31 +1,31 @@
-# 实验打包工具
+# Experimental Packaging Tools
 
-当前 GitHub 发布只包含源码，不附带可直接安装的 `.deb`、本机 runtime 或凭据。
-完整使用边界见 [部署说明](../docs/DEPLOYMENT.md)，构建依赖见 [构建说明](../docs/BUILDING.md)。
+The current GitHub release contains source only, with no ready-to-install `.deb`, local runtime or credentials.
+For the full usage boundaries see the [deployment notes](../docs/DEPLOYMENT.md), and for build dependencies the [build instructions](../docs/BUILDING.md).
 
-`package-native.py` 与 `control.py` 保留用于维护实验性的单用户原生桌面包。
-这个包采用 `/opt/ubuntu-native-takeover`，与日期化的 GDM 登录迁移 bundle 是不同路径；
-不要混用两套安装记录、manifest、编译前缀或回滚脚本。
+`package-native.py` and `control.py` are kept to maintain the experimental single-user native desktop package.
+This package uses `/opt/ubuntu-native-takeover`, a different path from the dated GDM login-migration bundle;
+do not mix the two sets of install records, manifests, compile prefixes or rollback scripts.
 
-## 打包前提
+## Packaging prerequisites
 
-- 已有匹配 GNOME Shell / Mutter ABI 的构建产物、完整运行依赖与 ABI 诊断记录。
-- 运行过对应二进制的隔离集成测试，而非借用开发机器的旧结果。
-- 核对完整对应源码、GVDB 等子项目及各依赖许可证；当前源码仓库不包含离线依赖缓存。
-- 在专用测试机上验证生成包的安装、正常登录、远程接管与回退。
+- Build artifacts matching the GNOME Shell / Mutter ABI, the complete runtime dependencies and the ABI diagnostic record already exist.
+- Isolated integration tests have been run against the corresponding binaries, rather than borrowing old results from the development machine.
+- The complete corresponding sources, sub-projects such as GVDB, and the licenses of all dependencies have been checked; the current source repository contains no offline dependency cache.
+- Installation of the generated package, normal login, remote takeover and rollback have been verified on a dedicated test machine.
 
-可先查看不执行构建的计划：
+A plan that does not run the build can be viewed first:
 
 ```bash
 python3 scripts/package-native.py --plan
 ```
 
-当前 `.deb` 组包器只产出开发候选；组包会清除旧兼容收据，尚没有受支持的二进制
-验收、重新封包和发布流程，不能把生成的 `.deb` 当成可启用版本。
-`control.py` 的 setup 首先要求 root 管理的最终产物和目标测试收据全部匹配，随后才交互设置 RDP 凭据及本机 TLS
-材料。此入口不等于已完成的新机器 GDM 登录安装方案。仓库不提供现成账号密码，
-也不要把这些材料加入 Git。
+The current `.deb` assembler produces development candidates only; assembling clears old compatibility receipts, and there is not yet a supported binary
+acceptance, re-packaging and release process, so a generated `.deb` must not be treated as an enableable version.
+The setup in `control.py` first requires the root-managed final artifacts and the target test receipts to all match, and only then interactively sets the RDP credentials and the local TLS
+material. This entry point is not a finished GDM login installation plan for a new machine. The repository provides no ready-made account or password,
+and such material must not be added to Git.
 
-修改 Mutter 需要用户保存工作并重新登录/重启加载；安装准备和桌面切换应分开进行。
-RDP 断开保留应用，注销则会关闭应用。本机接回使用独立密码认证界面，
-Ctrl+Alt+Delete 不会绕过密码认证。
+Modifying Mutter requires the user to save work and log in again/reboot to load it; installation preparation and the desktop switch should be done separately.
+Disconnecting RDP keeps the applications, while logging out closes them. Local reclaim uses a separate password-authentication screen,
+and Ctrl+Alt+Delete does not bypass password authentication.

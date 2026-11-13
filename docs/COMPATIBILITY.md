@@ -20,6 +20,13 @@ four declared Ubuntu 2.4 backports and project patches. The updated system
 profile does not claim that the private build contains the complete Ubuntu
 2.5 patch series. A profile is a candidate specification, not a passing result.
 
+The host branch adds three profiles for the development host's package set,
+each pinning the patch hashes of one runtime: `host-20261110`,
+`host-multimon-20261111` (remote-only extra monitors) and
+`host-scale-20261113` (client scale, scale-only display requests during a
+lease). Any change to `patches/*.patch` needs a new profile with the new
+hashes, or `record-manifest` refuses the build.
+
 Three inputs must agree:
 
 1. The profile declares exact target versions, SONAMEs, exported symbols,

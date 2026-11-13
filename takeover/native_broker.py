@@ -16,20 +16,74 @@ import struct
 
 from gi.repository import Gio, GLib
 from takeover.monitor_layout import MonitorLayout
-from takeover.remote_settings import save_scale, validate_scale
+from takeover.remote_settings import client_scale, save_scale, validate_scale
 
 NAME = 'org.gnome.Mutter.NativeTakeover'
 OBJECT = '/org/gnome/Mutter/NativeTakeover'
 
 
-def resolution_request(line, verb):
-    fields = line.split()
-    if len(fields) != 3 or fields[0] != verb:
-        raise ValueError('Invalid resolution request')
-    width, height = map(int, fields[1:])
+# GRD allows four client monitors: the viewport plus three remote-only ones.
+MAX_EXTRA_MONITORS = 3
+
+
+def _size(width, height):
     if not 200 <= width <= 8192 or not 200 <= height <= 8192:
         raise ValueError('Resolution outside 200..8192')
     return width, height
+
+
+def _scale_field(field):
+    return field[:1] in (b'S', 'S') and field[1:].isdigit()
+
+
+def requested_scale(line):
+    """Scale the RDP client announced in a trailing 'S<percent>', else None."""
+    fields = line.split()
+    if len(fields) < 2 or not _scale_field(fields[-1]):
+        return None
+    return client_scale(int(fields[-1][1:]))
+
+
+def layout_request(line, verbs):
+    """Parse 'VERB w h [x y w h]... [S<percent>]': viewport, extra monitors.
+
+    Extra positions are client pixels relative to the viewport's top-left.
+    The optional client scale is read with requested_scale().
+    """
+    fields = line.split()
+    if len(fields) > 1 and _scale_field(fields[-1]):
+        fields.pop()
+    if (not fields or fields[0] not in verbs or len(fields) < 3 or
+            (len(fields) - 3) % 4):
+        raise ValueError('Invalid layout request')
+    values = [int(value) for value in fields[1:]]
+    size = _size(*values[:2])
+    extras = tuple(tuple(values[i:i + 4]) for i in range(2, len(values), 4))
+    if len(extras) > MAX_EXTRA_MONITORS:
+        raise ValueError('Too many remote monitors')
+    for x, y, width, height in extras:
+        _size(width, height)
+        if abs(x) > 65536 or abs(y) > 65536:
+            raise ValueError('Remote monitor position out of range')
+    return fields[0], size, extras
+
+
+# The scale announced by the RDP client always wins. Without one the desktop
+# uses the user's saved setting. The GDM greeter runs as a dynamic gdm account
+# and cannot read that file, so its fallback is a 1:1 login form.
+GREETER_SCALE = 100
+
+
+def initial_scale(greeter):
+    """Fallback scale of a new broker; None reads the user's saved setting."""
+    return GREETER_SCALE if greeter else None
+
+
+def resolution_request(line, verb):
+    _, size, extras = layout_request(line, (verb,))
+    if extras:
+        raise ValueError('Invalid resolution request')
+    return size
 
 
 class NativeDesktop:
@@ -156,10 +210,22 @@ class Broker:
         self.session = session
         self.busy = False
         self.layout = layout
+        # Last scale the client announced in this lease. Only a change is
+        # applied, so a manual scale survives resizing the client window.
+        self.client_scale = None
 
     async def read_updates(self, reader):
+        verbs = (b'RESIZE', b'LAYOUT')
+
+        def parse(line):
+            try:
+                return layout_request(line, verbs) + (requested_scale(line),)
+            except ValueError as exc:
+                # A rejected layout keeps the current one and the lease.
+                print(json.dumps({'event': 'native-resize-rejected', 'reason': str(exc)}), flush=True)
+                return None
         while line := await reader.readline():
-            size = resolution_request(line, b'RESIZE')
+            request = parse(line)
             # Coalesce resize bursts while the user drags the client window.
             while True:
                 try:
@@ -168,10 +234,18 @@ class Broker:
                     break
                 if not line:
                     return
-                size = resolution_request(line, b'RESIZE')
+                request = parse(line) or request
+            if request is None:
+                continue
+            verb, size, extras, scale = request
             if not self.desktop.revoked.is_set() and await self.desktop.state() == 'remote':
+                options = {}
+                if verb == b'LAYOUT':
+                    options['extras'] = extras
+                if scale is not None and scale != self.client_scale:
+                    options['scale_percent'] = self.client_scale = scale
                 try:
-                    self.layout.resize(*size)
+                    self.layout.resize(*size, **options)
                 except Exception as exc:
                     print(json.dumps({'event': 'native-resize-rejected', 'reason': str(exc)}), flush=True)
 
@@ -198,16 +272,28 @@ class Broker:
                 await writer.drain()
                 return
             if request == b'STATUS\n':
-                writer.write((json.dumps({'native_state': await self.desktop.state(),
-                                          'remote': self.busy, 'session': self.session}) + '\n').encode())
+                status = {'native_state': await self.desktop.state(),
+                          'remote': self.busy, 'session': self.session}
+                try:
+                    # Dashboard facts; never a reason to fail the health check.
+                    status.update(dict(self.layout.describe()),
+                                  client_scale=self.client_scale if self.busy else None)
+                    json.dumps(status)
+                except Exception:
+                    status = {key: status[key] for key in ('native_state', 'remote', 'session')}
+                writer.write((json.dumps(status) + '\n').encode())
                 await writer.drain()
                 return
             if (request != b'REMOTE\n' and not request.startswith(b'REMOTE ')) or self.busy:
                 writer.write(b'DENIED!\n')
                 await writer.drain()
                 return
-            size = resolution_request(request, b'REMOTE') if request != b'REMOTE\n' else None
+            size, extras = None, ()
+            if request != b'REMOTE\n':
+                _, size, extras = layout_request(request, (b'REMOTE',))
             self.busy = owned = True  # no await between check and reservation
+            self.client_scale = requested_scale(request)
+            self.layout.begin_scale(self.client_scale)
             if self.greeter:
                 login_reader, login_writer = await asyncio.open_unix_connection(self.gateway)
                 login_writer.write((json.dumps({'command':'lease','role':'greeter',
@@ -219,7 +305,8 @@ class Broker:
             self.layout.enter()
             if size:
                 try:
-                    self.layout.resize(*size)
+                    self.layout.resize(*size, extras=extras,
+                                       scale_percent=self.layout.scale_percent)
                 except Exception as exc:
                     # Resolution preference must not turn a usable native
                     # session into a failed login. Keep the single-screen mode.
@@ -290,7 +377,8 @@ async def main(args):
     try:
         if await desktop.state() not in ('local', 'ready-guarded'):
             raise RuntimeError('Patched native Mutter is unavailable or not ready')
-        layout = MonitorLayout(desktop.connection, path.parent / 'monitor-layout.json')
+        layout = MonitorLayout(desktop.connection, path.parent / 'monitor-layout.json',
+                               scale_percent=initial_scale(args.greeter))
         layout.restore()
         broker = Broker(desktop, args.session, layout, greeter=args.greeter, gateway=args.gateway)
         server = await asyncio.start_unix_server(broker.handle, path=str(path), limit=256)

@@ -51,18 +51,109 @@
  } MetaMonitorManagerPrivate;
  
  G_DEFINE_TYPE_WITH_PRIVATE (MetaMonitorManager, meta_monitor_manager,
-@@ -979,24 +981,50 @@
+@@ -680,6 +682,80 @@
+   meta_monitors_config_set_parent_config (config, base_config);
+ }
+ 
++/* Client placement of remote-only monitors for the current viewport lease. */
++static MetaNativeExtraMonitor native_extra[META_NATIVE_MAX_EXTRA_MONITORS];
++static unsigned int n_native_extra;
++
++/* Set while a request that does not know the viewport (GNOME Settings) is
++ * applied as a scale change of the remote desktop. */
++static gboolean native_foreign_scale;
++
++/* Such a request may change nothing but the scale: the same physical
++ * monitors in the same modes as the passengers of the current viewport. */
++static gboolean
++native_request_keeps_monitors (MetaLogicalMonitorConfig *request,
++                               MetaLogicalMonitorConfig *viewport)
++{
++  if (g_list_length (request->monitor_configs) !=
++      g_list_length (viewport->monitor_configs))
++    return FALSE;
++
++  for (GList *l = request->monitor_configs; l; l = l->next)
++    {
++      MetaMonitorConfig *wanted = l->data;
++      gboolean found = FALSE;
++
++      for (GList *c = viewport->monitor_configs; c && !found; c = c->next)
++        {
++          MetaMonitorConfig *current = c->data;
++
++          found = meta_monitor_spec_equals (wanted->monitor_spec,
++                                            current->monitor_spec) &&
++                  wanted->mode_spec->width == current->mode_spec->width &&
++                  wanted->mode_spec->height == current->mode_spec->height &&
++                  wanted->mode_spec->refresh_rate == current->mode_spec->refresh_rate &&
++                  wanted->mode_spec->refresh_rate_mode == current->mode_spec->refresh_rate_mode &&
++                  wanted->mode_spec->flags == current->mode_spec->flags;
++        }
++      if (!found)
++        return FALSE;
++    }
++
++  return TRUE;
++}
++
++/* While an authenticated viewport is current, monitor changes must not
++ * replace it with a stored or linear physical layout: remote-only monitors
++ * are added or removed, unplugged passengers are dropped, and a newly
++ * plugged physical output stays disabled until the lease ends. */
++static MetaMonitorsConfig *
++ensure_native_takeover_configured (MetaMonitorManager *manager)
++{
++  g_autoptr (GError) error = NULL;
++  MetaMonitorsConfig *config;
++
++  if (!g_getenv ("MUTTER_NATIVE_TAKEOVER") || !meta_native_privacy_has_lease ())
++    return NULL;
++
++  config = meta_monitor_config_manager_native_extend (
++    manager, meta_monitor_config_manager_get_current (manager->config_manager),
++    native_extra, n_native_extra);
++  if (!config)
++    return NULL;
++
++  if (!meta_monitor_manager_apply_monitors_config (manager, config,
++                                                   META_MONITORS_CONFIG_METHOD_TEMPORARY,
++                                                   &error))
++    {
++      g_warning ("[NativeTakeover] Could not keep the remote viewport: %s",
++                 error->message);
++      g_object_unref (config);
++      return NULL;
++    }
++
++  return config;
++}
++
+ MetaMonitorsConfig *
+ meta_monitor_manager_ensure_configured (MetaMonitorManager *manager)
+ {
+@@ -693,6 +769,10 @@
+   MetaMonitorsConfig *previous_config;
+   g_autoptr (GList) existing_configs = NULL;
+   GList *l;
++
++  config = ensure_native_takeover_configured (manager);
++  if (config)
++    goto done;
+ 
+   use_stored_config = should_use_stored_config (manager);
+   if (use_stored_config)
+@@ -979,24 +1059,50 @@
    return TRUE;
  }
  
--static void
--orientation_changed (MetaMonitorManager *manager)
 +/*
 + * Inhibit orientation tracking only when the panel orientation is unmanaged
 + * and the initial orientation has already been read. Before the initial read
 + * the sensor must be claimable so handle_initial_orientation_change() can run.
 + */
-+static void
+ static void
+-orientation_changed (MetaMonitorManager *manager)
 +sync_orientation_unmanaged_inhibit (MetaMonitorManager *manager)
  {
    MetaMonitorManagerPrivate *priv =
@@ -110,7 +201,7 @@
      }
  
    if (!manager->panel_orientation_managed)
-@@ -1120,23 +1148,18 @@
+@@ -1120,23 +1226,18 @@
    meta_dbus_display_config_set_panel_orientation_managed (manager->display_config,
                                                            manager->panel_orientation_managed);
  
@@ -142,7 +233,19 @@
        if (current_config)
          {
            g_autoptr (MetaMonitorsConfig) config = NULL;
-@@ -2306,6 +2329,27 @@
+@@ -2242,6 +2343,11 @@
+                                  g_variant_new_int32 (min_refresh_rate));
+         }
+ 
++      if (g_getenv ("MUTTER_NATIVE_TAKEOVER"))
++        g_variant_builder_add (&monitor_properties_builder, "{sv}",
++                               "native-takeover-remote-only",
++                               g_variant_new_boolean (meta_monitor_is_native_remote_only (monitor)));
++
+       is_for_lease = meta_monitor_is_for_lease (monitor);
+       g_variant_builder_add (&monitor_properties_builder, "{sv}",
+                              "is-for-lease",
+@@ -2306,6 +2412,41 @@
    g_variant_builder_init (&properties_builder, G_VARIANT_TYPE ("a{sv}"));
    capabilities = meta_monitor_manager_get_capabilities (manager);
  
@@ -156,21 +259,35 @@
 +      g_variant_builder_add (&properties_builder, "{sv}",
 +                             "native-takeover-scale-supported",
 +                             g_variant_new_boolean (TRUE));
-+      if (current && current->logical_monitor_configs)
++      g_variant_builder_add (&properties_builder, "{sv}",
++                             "native-takeover-multimonitor-supported",
++                             g_variant_new_boolean (TRUE));
++      for (GList *native_l = current ? current->logical_monitor_configs : NULL;
++           native_l; native_l = native_l->next)
 +        {
-+          MetaLogicalMonitorConfig *logical = current->logical_monitor_configs->data;
-+          if (logical->native_takeover_viewport)
-+            g_variant_builder_add (&properties_builder, "{sv}",
-+                                   "native-takeover-size",
-+                                   g_variant_new ("(uu)", logical->native_viewport_width,
-+                                                  logical->native_viewport_height));
++          MetaLogicalMonitorConfig *logical = native_l->data;
++          GVariantBuilder extra;
++          if (!logical->native_takeover_viewport)
++            continue;
++          g_variant_builder_add (&properties_builder, "{sv}",
++                                 "native-takeover-size",
++                                 g_variant_new ("(uu)", logical->native_viewport_width,
++                                                logical->native_viewport_height));
++          g_variant_builder_init (&extra, G_VARIANT_TYPE ("a(iiuu)"));
++          for (unsigned int native_i = 0; native_i < n_native_extra; native_i++)
++            g_variant_builder_add (&extra, "(iiuu)",
++                                   native_extra[native_i].x, native_extra[native_i].y,
++                                   native_extra[native_i].width, native_extra[native_i].height);
++          g_variant_builder_add (&properties_builder, "{sv}",
++                                 "native-takeover-extra", g_variant_builder_end (&extra));
++          break;
 +        }
 +    }
 +
    g_variant_builder_add (&properties_builder, "{sv}",
                           "layout-mode",
                           g_variant_new_uint32 (manager->layout_mode));
-@@ -2462,7 +2506,8 @@
+@@ -2462,7 +2603,8 @@
                return FALSE;
              }
  
@@ -180,7 +297,7 @@
                                                                     config,
                                                                     monitor,
                                                                     monitor_mode,
-@@ -2721,6 +2766,7 @@
+@@ -2721,6 +2863,7 @@
  create_logical_monitor_config_from_variant (MetaMonitorManager          *manager,
                                              GVariant                    *logical_monitor_config_variant,
                                              MetaLogicalMonitorLayoutMode layout_mode,
@@ -188,10 +305,12 @@
                                              GError                     **error)
  {
    MetaLogicalMonitorConfig *logical_monitor_config;
-@@ -2741,6 +2787,12 @@
+@@ -2741,6 +2884,14 @@
                   &is_primary,
                   &monitor_configs_iter);
    scale = (float) scale_d;
++  if (native_size && native_foreign_scale)
++    scale = CLAMP (roundf (scale * 4) / 4, 1.0f, 2.0f);
 +  if (native_size && (!isfinite (scale) || scale < 1.0f || scale > 2.0f))
 +    {
 +      g_variant_iter_free (monitor_configs_iter);
@@ -201,7 +320,7 @@
  
    while (TRUE)
      {
-@@ -2777,7 +2829,7 @@
+@@ -2777,7 +2928,7 @@
      }
  
    first_monitor_config = monitor_configs->data;
@@ -210,7 +329,7 @@
                                  layout_mode,
                                  first_monitor_config,
                                  scale,
-@@ -2803,6 +2855,24 @@
+@@ -2803,6 +2954,24 @@
      .monitor_configs = monitor_configs
    };
  
@@ -235,20 +354,62 @@
    if (!meta_verify_logical_monitor_config (logical_monitor_config,
                                             layout_mode,
                                             manager,
-@@ -2913,6 +2983,7 @@
+@@ -2913,6 +3082,10 @@
    const MetaMonitorConfigPolicy *policy;
    MetaMonitorManagerCapability capabilities;
    g_autoptr (GVariant) layout_mode_variant = NULL;
 +  g_autoptr (GVariant) native_size = NULL;
++  g_autoptr (GVariant) native_extra_variant = NULL;
++  MetaNativeExtraMonitor requested_extra[META_NATIVE_MAX_EXTRA_MONITORS];
++  unsigned int n_requested_extra = 0;
    MetaLogicalMonitorLayoutMode layout_mode;
    GVariantIter logical_monitor_configs_iter;
    g_autoptr (MetaMonitorsConfig) config = NULL;
-@@ -2974,6 +3045,21 @@
+@@ -2974,6 +3147,99 @@
        return G_DBUS_METHOD_INVOCATION_HANDLED;
      }
  
 +  native_size = g_variant_lookup_value (properties_variant,
 +                                        "native-takeover-size", NULL);
++  MetaLogicalMonitorConfig *native_foreign_viewport = NULL;
++  native_foreign_scale = FALSE;
++  if (!native_size && g_getenv ("MUTTER_NATIVE_TAKEOVER") &&
++      meta_native_privacy_has_lease ())
++    {
++      g_autoptr (GVariant) native_release =
++        g_variant_lookup_value (properties_variant,
++                                "native-takeover-release", NULL);
++      MetaMonitorsConfig *native_current =
++        meta_monitor_config_manager_get_current (manager->config_manager);
++      MetaLogicalMonitorConfig *native_viewport = NULL;
++
++      for (GList *native_l = native_current && !native_release ?
++                               native_current->logical_monitor_configs : NULL;
++           native_l; native_l = native_l->next)
++        {
++          MetaLogicalMonitorConfig *logical = native_l->data;
++          if (logical->native_takeover_viewport)
++            native_viewport = logical;
++        }
++      if (native_viewport)
++        {
++          if (g_variant_n_children (logical_monitor_configs_variant) != 1)
++            {
++              g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
++                                                     G_DBUS_ERROR_INVALID_ARGS,
++                                                     "The remote session owns the display layout; only its scale can be changed");
++              return G_DBUS_METHOD_INVOCATION_HANDLED;
++            }
++          native_size = g_variant_ref_sink (
++            g_variant_new ("(uu)", native_viewport->native_viewport_width,
++                           native_viewport->native_viewport_height));
++          native_foreign_scale = TRUE;
++          native_foreign_viewport = native_viewport;
++          /* Never a persistent physical setup, and no confirmation dialog. */
++          if (method == META_MONITORS_CONFIG_METHOD_PERSISTENT)
++            method = META_MONITORS_CONFIG_METHOD_TEMPORARY;
++        }
++    }
 +  if (native_size &&
 +      (!g_variant_is_of_type (native_size, G_VARIANT_TYPE ("(uu)")) ||
 +       !meta_native_privacy_has_lease () ||
@@ -262,10 +423,49 @@
 +      return G_DBUS_METHOD_INVOCATION_HANDLED;
 +    }
 +
++  native_extra_variant = g_variant_lookup_value (properties_variant,
++                                                 "native-takeover-extra", NULL);
++  if (native_extra_variant)
++    {
++      GVariantIter extra_iter;
++      gint32 extra_x, extra_y;
++      guint32 extra_width, extra_height;
++
++      if (!native_size ||
++          !g_variant_is_of_type (native_extra_variant, G_VARIANT_TYPE ("a(iiuu)")) ||
++          g_variant_n_children (native_extra_variant) > META_NATIVE_MAX_EXTRA_MONITORS)
++        {
++          g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
++                                                 G_DBUS_ERROR_INVALID_ARGS,
++                                                 "Invalid native remote monitor placement");
++          return G_DBUS_METHOD_INVOCATION_HANDLED;
++        }
++
++      g_variant_iter_init (&extra_iter, native_extra_variant);
++      while (g_variant_iter_next (&extra_iter, "(iiuu)", &extra_x, &extra_y,
++                                  &extra_width, &extra_height))
++        {
++          if (extra_width < 200 || extra_width > 8192 ||
++              extra_height < 200 || extra_height > 8192 ||
++              extra_x < -65536 || extra_x > 65536 ||
++              extra_y < -65536 || extra_y > 65536)
++            {
++              g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
++                                                     G_DBUS_ERROR_INVALID_ARGS,
++                                                     "Invalid native remote monitor placement");
++              return G_DBUS_METHOD_INVOCATION_HANDLED;
++            }
++          requested_extra[n_requested_extra++] = (MetaNativeExtraMonitor) {
++            .x = extra_x, .y = extra_y,
++            .width = (int) extra_width, .height = (int) extra_height,
++          };
++        }
++    }
++
    g_variant_iter_init (&logical_monitor_configs_iter,
                         logical_monitor_configs_variant);
    while (TRUE)
-@@ -2989,6 +3075,7 @@
+@@ -2989,6 +3255,7 @@
          create_logical_monitor_config_from_variant (manager,
                                                      logical_monitor_config_variant,
                                                      layout_mode,
@@ -273,6 +473,60 @@
                                                      &error);
        g_variant_unref (logical_monitor_config_variant);
  
+@@ -3002,6 +3269,19 @@
+           return G_DBUS_METHOD_INVOCATION_HANDLED;
+         }
+ 
++      if (native_foreign_viewport &&
++          !native_request_keeps_monitors (logical_monitor_config,
++                                          native_foreign_viewport))
++        {
++          meta_logical_monitor_config_free (logical_monitor_config);
++          g_list_free_full (logical_monitor_configs,
++                            (GDestroyNotify) meta_logical_monitor_config_free);
++          g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
++                                                 G_DBUS_ERROR_INVALID_ARGS,
++                                                 "The remote session owns the display layout; only its scale can be changed");
++          return G_DBUS_METHOD_INVOCATION_HANDLED;
++        }
++
+       logical_monitor_configs = g_list_append (logical_monitor_configs,
+                                                logical_monitor_config);
+     }
+@@ -3017,6 +3297,18 @@
+                                           for_lease_monitor_specs,
+                                           layout_mode,
+                                           META_MONITORS_CONFIG_FLAG_NONE);
++  if (native_size)
++    {
++      MetaMonitorsConfig *extended =
++        meta_monitor_config_manager_native_extend (manager, config,
++                                                   requested_extra,
++                                                   n_requested_extra);
++      if (extended)
++        {
++          g_object_unref (config);
++          config = extended;
++        }
++    }
+   if (!meta_verify_monitors_config (config, manager, &error))
+     {
+       g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
+@@ -3048,6 +3340,14 @@
+                                              G_DBUS_ERROR_INVALID_ARGS,
+                                              "%s", error->message);
+       return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
++  if (method != META_MONITORS_CONFIG_METHOD_VERIFY)
++    {
++      /* Placement hints belong only to the viewport they were applied with. */
++      n_native_extra = native_size ? n_requested_extra : 0;
++      memcpy (native_extra, requested_extra,
++              n_native_extra * sizeof (MetaNativeExtraMonitor));
+     }
+ 
+   if (method == META_MONITORS_CONFIG_METHOD_PERSISTENT)
 --- a/src/tests/meson.build
 +++ b/src/tests/meson.build
 @@ -339,6 +339,17 @@
@@ -591,7 +845,7 @@
 +}
 --- /dev/null
 +++ b/src/backends/meta-native-privacy.h
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,20 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +#pragma once
 +#include "meta/meta-context.h"
@@ -600,6 +854,9 @@
 +struct _MetaLogicalMonitor;
 +gboolean meta_native_privacy_get_viewport_size (struct _MetaLogicalMonitor *monitor,
 +                                                int *width, int *height);
++/* FALSE only for an extra remote-only monitor beside an active viewport.
++ * Unknown views, and every view without a viewport, are physical. */
++gboolean meta_native_privacy_view_is_physical (ClutterStageView *view);
 +void meta_native_privacy_init (MetaContext *context);
 +gboolean meta_native_privacy_active (void);
 +gboolean meta_native_privacy_has_lease (void);
@@ -611,7 +868,7 @@
 +gboolean meta_native_privacy_is_cleanup_event (const ClutterEvent *event);
 --- /dev/null
 +++ b/src/backends/meta-native-privacy.c
-@@ -0,0 +1,1270 @@
+@@ -0,0 +1,1342 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later
 + * Native seat privacy for an authenticated RDP lease. The actual GNOME session
 + * retains its DRM, libinput and Wayland clients throughout the handover.
@@ -623,6 +880,10 @@
 +#include "backends/meta-backend-private.h"
 +#include "backends/meta-monitor-config-manager.h"
 +#include "backends/meta-monitor-manager-private.h"
++#include "backends/meta-monitor-private.h"
++#include "backends/meta-crtc.h"
++#include "backends/meta-output.h"
++#include "backends/meta-renderer-view.h"
 +#include "clutter/clutter-mutter.h"
 +#include "meta/compositor.h"
 +#include "meta/meta-remote-access-controller.h"
@@ -701,6 +962,7 @@
 +  "<method name='GetStatus'><arg type='a{sv}' direction='out'/></method>"
 +  "<method name='InspectPhysical'><arg type='u' direction='out'/>"
 +  "<arg type='b' direction='out'/></method>"
++  "<method name='InspectViews'><arg type='a(bbiiii)' direction='out'/></method>"
 +  "<method name='PrepareLogin'><arg type='o' direction='in'/></method>"
 +  "<method name='TestHoldInput'/>"
 +  "<method name='TestLocalKey'><arg type='u' direction='in'/><arg type='b' direction='in'/></method>"
@@ -741,12 +1003,52 @@
 +  if (monitor != meta_monitor_manager_get_primary_logical_monitor (manager)) return FALSE;
 +  MetaMonitorsConfig *config = meta_monitor_config_manager_get_current (
 +    meta_monitor_manager_get_config_manager (manager));
-+  if (!config || !config->logical_monitor_configs) return FALSE;
-+  MetaLogicalMonitorConfig *logical = config->logical_monitor_configs->data;
-+  if (!logical->native_takeover_viewport) return FALSE;
-+  *width = logical->native_viewport_width;
-+  *height = logical->native_viewport_height;
-+  return TRUE;
++  if (!config) return FALSE;
++  /* The viewport is the primary logical monitor; remote-only virtual
++   * monitors may follow it in the same temporary configuration. */
++  for (GList *l = config->logical_monitor_configs; l; l = l->next)
++    {
++      MetaLogicalMonitorConfig *logical = l->data;
++      if (!logical->native_takeover_viewport) continue;
++      *width = logical->native_viewport_width;
++      *height = logical->native_viewport_height;
++      return TRUE;
++    }
++  return FALSE;
++}
++
++static gboolean
++viewport_is_current (MetaMonitorManager *manager)
++{
++  MetaMonitorsConfig *config = meta_monitor_config_manager_get_current (
++    meta_monitor_manager_get_config_manager (manager));
++  for (GList *l = config ? config->logical_monitor_configs : NULL; l; l = l->next)
++    if (((MetaLogicalMonitorConfig *) l->data)->native_takeover_viewport)
++      return TRUE;
++  return FALSE;
++}
++
++gboolean
++meta_native_privacy_view_is_physical (ClutterStageView *view)
++{
++  /* Fail closed: anything that cannot be proven to be an extra remote-only
++   * monitor is treated as a physical output and receives the barrier. */
++  if (!privacy_context || !META_IS_RENDERER_VIEW (view)) return TRUE;
++  MetaMonitorManager *manager = meta_backend_get_monitor_manager (backend ());
++  if (!viewport_is_current (manager)) return TRUE;
++  MetaCrtc *crtc = meta_renderer_view_get_crtc (META_RENDERER_VIEW (view));
++  const GList *outputs = crtc ? meta_crtc_get_outputs (crtc) : NULL;
++  if (!outputs) return TRUE;
++  for (const GList *l = outputs; l; l = l->next)
++    {
++      MetaMonitor *monitor = meta_output_get_monitor (l->data);
++      /* Physical passengers, and every other output, stay protected. */
++      if (!monitor || !meta_monitor_is_native_remote_only (monitor)) return TRUE;
++      MetaLogicalMonitor *logical = meta_monitor_get_logical_monitor (monitor);
++      if (!logical || logical == meta_monitor_manager_get_primary_logical_monitor (manager))
++        return TRUE;
++    }
++  return FALSE;
 +}
 +
 +static const char * state (void)
@@ -1461,8 +1763,11 @@
 +  g_hash_table_add (presented_views, view);
 +  views = clutter_stage_peek_stage_views (stage ());
 +  if (!views) return;
++  /* Remote-only monitors are never painted black and never shown locally;
++   * every physical output must still acknowledge a black frame. */
 +  for (l = views; l; l = l->next)
-+    if (!g_hash_table_contains (presented_views, l->data)) return;
++    if (meta_native_privacy_view_is_physical (l->data) &&
++        !g_hash_table_contains (presented_views, l->data)) return;
 +  if (timeout_id) { g_source_remove (timeout_id); timeout_id = 0; }
 +  if (greeter_mode)
 +    {
@@ -1708,6 +2013,8 @@
 +      GList *l;
 +      for (l = clutter_stage_peek_stage_views (stage ()); l; l = l->next)
 +        {
++          if (!meta_native_privacy_view_is_physical (l->data))
++            continue;
 +          CoglFramebuffer *fb = clutter_stage_view_get_framebuffer (l->data);
 +          int w = cogl_framebuffer_get_width (fb), h = cogl_framebuffer_get_height (fb);
 +          g_autofree guint8 *pixels = g_malloc (w * h * 4);
@@ -1725,6 +2032,28 @@
 +          n++;
 +        }
 +      g_dbus_method_invocation_return_value (invocation, g_variant_new ("(ub)", n, black && n > 0));
++      return;
++    }
++  if (g_str_equal (method, "InspectViews") && test_mode)
++    {
++      GVariantBuilder views;
++      g_variant_builder_init (&views, G_VARIANT_TYPE ("a(bbiiii)"));
++      for (GList *l = clutter_stage_peek_stage_views (stage ()); l; l = l->next)
++        {
++          MtkRectangle layout;
++          CoglFramebuffer *fb = clutter_stage_view_get_framebuffer (l->data);
++          int w = cogl_framebuffer_get_width (fb), h = cogl_framebuffer_get_height (fb);
++          g_autofree guint8 *pixels = g_malloc (w * h * 4);
++          gboolean black = cogl_framebuffer_read_pixels (fb, 0, 0, w, h,
++                                                         COGL_PIXEL_FORMAT_BGRA_8888_PRE, pixels);
++          for (int i = 0; black && i < w * h; i++)
++            if (pixels[i*4] || pixels[i*4+1] || pixels[i*4+2]) black = FALSE;
++          clutter_stage_view_get_layout (l->data, &layout);
++          g_variant_builder_add (&views, "(bbiiii)",
++                                 meta_native_privacy_view_is_physical (l->data), black,
++                                 layout.x, layout.y, layout.width, layout.height);
++        }
++      g_dbus_method_invocation_return_value (invocation, g_variant_new ("(a(bbiiii))", &views));
 +      return;
 +    }
 +  if (g_str_equal (method, "PrepareLogin") && startup_privacy_active ())
@@ -1976,7 +2305,7 @@
 +  running = TRUE;
 +  recovery_mode = FALSE;
 +  retry_after = 0;
-+  status_text = "输入本机密码，按 Enter 接回桌面";
++  status_text = "Enter the local password and press Enter to reclaim the desktop";
 +  (void) mlock (password, sizeof password);
 +  ticker = g_timeout_add_seconds (10, tick, NULL);
 +  redraw ();
@@ -2003,14 +2332,14 @@
 +      busy = FALSE;
 +      if (ok)
 +        {
-+          status_text = "验证成功，正在接回桌面…";
++          status_text = "Verified, reclaiming the desktop…";
 +          redraw ();
 +          if (on_verified) on_verified ();
 +        }
 +      else
 +        {
 +          retry_after = g_get_monotonic_time () + 2 * G_USEC_PER_SEC;
-+          status_text = "密码错误或认证不可用，请稍后重试";
++          status_text = "Wrong password or authentication unavailable, try again later";
 +          redraw ();
 +        }
 +    }
@@ -2026,7 +2355,7 @@
 +  if (!helper || !g_path_is_absolute (helper))
 +    {
 +      clear_password ();
-+      status_text = "认证服务未就绪，请从远程端断开连接";
++      status_text = "Authentication service not ready, disconnect from the remote side";
 +      redraw ();
 +      return;
 +    }
@@ -2037,7 +2366,7 @@
 +  if (!authentication)
 +    {
 +      clear_password ();
-+      status_text = "认证服务无法启动，请从远程端断开连接";
++      status_text = "Authentication service failed to start, disconnect from the remote side";
 +      redraw ();
 +      return;
 +    }
@@ -2048,7 +2377,7 @@
 +  clear_password ();
 +  if (!sent) g_subprocess_force_exit (authentication);
 +  busy = TRUE;
-+  status_text = "正在验证本机密码…";
++  status_text = "Verifying the local password…";
 +  AuthAttempt *attempt = g_new0 (AuthAttempt, 1);
 +  attempt->generation = generation;
 +  g_subprocess_wait_async (authentication, NULL, auth_done, attempt);
@@ -2116,22 +2445,22 @@
 +      cairo_paint (cr);
 +      GDateTime *now = g_date_time_new_now_local ();
 +      char *clock = g_date_time_format (now, "%H:%M");
-+      char *date = g_date_time_format (now, "%Y年%m月%d日");
++      char *date = g_date_time_format (now, "%B %-d, %Y");
 +      label (cr, clock, 76, 30, 1);
 +      label (cr, date, 20, 130, .75);
 +      label (cr, g_get_user_name (), 30, 205, 1);
-+      label (cr, recovery_mode ? "请验证本机密码以接回桌面" : "远程会话正在使用此电脑", 18, 255, .72);
++      label (cr, recovery_mode ? "Verify the local password to reclaim the desktop" : "A remote session is using this computer", 18, 255, .72);
 +      cairo_set_source_rgb (cr, .17, .18, .22);
 +      cairo_rectangle (cr, 200, 315, 400, 52);
 +      cairo_fill (cr);
 +      GString *dots = g_string_new (NULL);
 +      for (int i = 0; i < MIN (g_utf8_strlen (password, -1), 24); i++) g_string_append (dots, "●");
-+      label (cr, *dots->str ? dots->str : "密码", 19, 326, *dots->str ? 1 : .5);
++      label (cr, *dots->str ? dots->str : "Password", 19, 326, *dots->str ? 1 : .5);
 +      g_string_free (dots, TRUE);
 +      label (cr, status_text, 17, 395, .85);
 +      if (xkb_state_mod_name_is_active (key_state, XKB_MOD_NAME_CAPS, XKB_STATE_MODS_LOCKED))
-+        label (cr, "Caps Lock 已开启", 15, 435, .7);
-+      label (cr, recovery_mode ? "桌面和应用将继续保留" : "验证成功后，远程连接将断开", 15, 480, .5);
++        label (cr, "Caps Lock is on", 15, 435, .7);
++      label (cr, recovery_mode ? "Your desktop and apps will be kept" : "The remote connection will end after verification", 15, 480, .5);
 +      cairo_surface_flush (surface);
 +      g_clear_object (&texture);
 +      texture = COGL_TEXTURE (cogl_texture_2d_new_from_data (cogl, 800, 600,
@@ -2241,13 +2570,13 @@
  
 +  /* The physical authentication surface is independent of remote scene
 +   * damage. Clear/draw the whole physical output, not the app's damage clip. */
-+  if (meta_native_privacy_active ())
++  if (meta_native_privacy_active () && meta_native_privacy_view_is_physical (view))
 +    clutter_stage_view_add_redraw_clip (view, NULL);
 +
    notify_watchers_for_mode (meta_stage, view, NULL, frame,
                              META_STAGE_WATCH_BEFORE_PAINT);
  }
-@@ -277,7 +284,21 @@
+@@ -277,7 +284,24 @@
    ClutterFrame *frame;
    const MtkRegion *redraw_clip;
  
@@ -2255,9 +2584,12 @@
 +  gboolean physical_private;
 +
 +  /* Offscreen PipeWire repaint has no stage view and sees the original scene.
-+   * Never attach an actor overlay: that would also blacken remote capture. */
++   * Never attach an actor overlay: that would also blacken remote capture.
++   * Extra remote-only monitors have views but are never shown locally. */
 +  physical_private = meta_native_privacy_active () &&
-+                     clutter_paint_context_get_stage_view (paint_context) != NULL;
++                     clutter_paint_context_get_stage_view (paint_context) != NULL &&
++                     meta_native_privacy_view_is_physical (
++                       clutter_paint_context_get_stage_view (paint_context));
 +  if (physical_private)
 +    {
 +      cogl_framebuffer_clear4f (clutter_paint_context_get_framebuffer (paint_context),
@@ -2270,7 +2602,7 @@
  
    frame = clutter_paint_context_get_frame (paint_context);
    view = clutter_paint_context_get_stage_view (paint_context);
-@@ -288,7 +309,8 @@
+@@ -288,7 +312,8 @@
                                  META_STAGE_WATCH_AFTER_ACTOR_PAINT);
      }
  
@@ -2280,7 +2612,7 @@
  
    if (view)
      {
-@@ -308,6 +330,19 @@
+@@ -308,6 +333,19 @@
    CLUTTER_STAGE_CLASS (meta_stage_parent_class)->paint_view (stage, view,
                                                               redraw_clip,
                                                               frame);
@@ -2288,7 +2620,7 @@
 +  /* The stage actor clips to the remote desktop allocation. Draw the
 +   * physical login surface after that clip has been popped, so a smaller
 +   * remote desktop cannot crop a larger local monitor's password UI. */
-+  if (meta_native_privacy_active ())
++  if (meta_native_privacy_active () && meta_native_privacy_view_is_physical (view))
 +    {
 +      cogl_framebuffer_clear4f (clutter_stage_view_get_framebuffer (view),
 +                                COGL_BUFFER_BIT_COLOR, 0, 0, 0, 1);
@@ -2436,6 +2768,34 @@
  } MetaLogicalMonitorConfig;
  
  typedef struct _MetaMonitorsConfigKey
+@@ -210,6 +212,27 @@
+                                              MetaMonitorManager          *monitor_manager,
+                                              GError                     **error);
+ 
++/* Client-pixel geometry of a remote-only monitor, relative to the viewport. */
++typedef struct _MetaNativeExtraMonitor
++{
++  int x, y, width, height;
++} MetaNativeExtraMonitor;
++
++#define META_NATIVE_MAX_EXTRA_MONITORS 7
++
++/* Remote-only monitors are virtual monitors whose screen-cast stream carries
++ * the native takeover slot tag from the leased GRD. Other screen casts (for
++ * example a local Miracast sink) and headless test outputs are not. */
++void meta_monitor_set_native_remote_slot (const char *connector,
++                                          int         slot);
++int meta_monitor_get_native_remote_slot (MetaMonitor *monitor);
++gboolean meta_monitor_is_native_remote_only (MetaMonitor *monitor);
++
++MetaMonitorsConfig * meta_monitor_config_manager_native_extend (MetaMonitorManager           *monitor_manager,
++                                                                MetaMonitorsConfig           *config,
++                                                                const MetaNativeExtraMonitor *hints,
++                                                                unsigned int                  n_hints);
++
+ META_EXPORT_TEST
+ gboolean meta_verify_monitors_config (MetaMonitorsConfig *config,
+                                       MetaMonitorManager *monitor_manager,
 --- a/src/backends/meta-monitor-config-manager.c
 +++ b/src/backends/meta-monitor-config-manager.c
 @@ -19,6 +19,7 @@
@@ -2446,15 +2806,14 @@
  
  #include "backends/meta-monitor-config-manager.h"
  
-@@ -1817,6 +1818,28 @@
+@@ -1817,6 +1818,27 @@
        return FALSE;
      }
  
 +  if (logical_monitor_config->native_takeover_viewport)
 +    {
++      /* Remote-only monitors left of/above the viewport may offset it. */
 +      if (!meta_native_privacy_has_lease () ||
-+          logical_monitor_config->layout.x != 0 ||
-+          logical_monitor_config->layout.y != 0 ||
 +          logical_monitor_config->native_viewport_width < 200 ||
 +          logical_monitor_config->native_viewport_width > 8192 ||
 +          logical_monitor_config->native_viewport_height < 200 ||
@@ -2475,6 +2834,268 @@
    first_monitor_config = logical_monitor_config->monitor_configs->data;
    mode_width = first_monitor_config->mode_spec->width;
    mode_height = first_monitor_config->mode_spec->height;
+@@ -1979,3 +2001,261 @@
+ 
+   return TRUE;
+ }
++
++static GHashTable *native_remote_slots;
++
++void
++meta_monitor_set_native_remote_slot (const char *connector,
++                                     int         slot)
++{
++  if (!native_remote_slots)
++    native_remote_slots = g_hash_table_new_full (g_str_hash, g_str_equal,
++                                                 g_free, NULL);
++  if (slot < 0)
++    g_hash_table_remove (native_remote_slots, connector);
++  else
++    g_hash_table_insert (native_remote_slots, g_strdup (connector),
++                         GINT_TO_POINTER (slot + 1));
++}
++
++int
++meta_monitor_get_native_remote_slot (MetaMonitor *monitor)
++{
++  if (!native_remote_slots || !meta_monitor_is_virtual (monitor))
++    return -1;
++
++  return GPOINTER_TO_INT (g_hash_table_lookup (native_remote_slots,
++                                               meta_monitor_get_spec (monitor)->connector)) - 1;
++}
++
++gboolean
++meta_monitor_is_native_remote_only (MetaMonitor *monitor)
++{
++  return meta_monitor_get_native_remote_slot (monitor) >= 0;
++}
++
++static int
++native_logical_coordinate (int   value,
++                           float scale)
++{
++  return value >= 0 ? (int) ceilf (value / scale) : -(int) ceilf (-value / scale);
++}
++
++static guint64
++native_virtual_sequence (MetaMonitor *monitor)
++{
++  const char *connector = meta_monitor_get_spec (monitor)->connector;
++
++  return g_str_has_prefix (connector, "Meta-") ?
++    g_ascii_strtoull (connector + 5, NULL, 10) : G_MAXUINT64;
++}
++
++static int
++compare_native_virtual (gconstpointer a,
++                        gconstpointer b)
++{
++  guint64 first = native_virtual_sequence (*(MetaMonitor **) a);
++  guint64 second = native_virtual_sequence (*(MetaMonitor **) b);
++
++  return first < second ? -1 : first > second;
++}
++
++static gboolean
++native_monitor_is_passenger (MetaLogicalMonitorConfig *viewport,
++                             MetaMonitor              *monitor)
++{
++  for (GList *l = viewport->monitor_configs; l; l = l->next)
++    {
++      MetaMonitorConfig *monitor_config = l->data;
++
++      if (meta_monitor_spec_equals (monitor_config->monitor_spec,
++                                    meta_monitor_get_spec (monitor)))
++        return TRUE;
++    }
++
++  return FALSE;
++}
++
++static MetaMonitorsConfig *
++native_extended_config (MetaMonitorManager           *monitor_manager,
++                        MetaMonitorsConfig           *config,
++                        MetaLogicalMonitorConfig     *viewport,
++                        GPtrArray                    *virtuals,
++                        const MetaNativeExtraMonitor *hints,
++                        unsigned int                  n_hints,
++                        gboolean                      use_hints)
++{
++  gboolean used[META_NATIVE_MAX_EXTRA_MONITORS] = { FALSE };
++  g_autoptr (GError) error = NULL;
++  MetaLogicalMonitorConfig *primary;
++  GList *logical_monitor_configs;
++  GList *single;
++  MetaMonitorsConfig *result;
++  int row_x, min_x = 0, min_y = 0;
++
++  single = g_list_append (NULL, viewport);
++  logical_monitor_configs = meta_clone_logical_monitor_config_list (single);
++  g_list_free (single);
++  primary = logical_monitor_configs->data;
++  primary->layout.x = 0;
++  primary->layout.y = 0;
++  row_x = primary->layout.width;
++
++  /* A physical output unplugged during the lease leaves the viewport. */
++  for (GList *l = primary->monitor_configs; l;)
++    {
++      GList *next = l->next;
++      MetaMonitorConfig *monitor_config = l->data;
++
++      if (!meta_monitor_manager_get_monitor_from_spec (monitor_manager,
++                                                       monitor_config->monitor_spec))
++        {
++          meta_monitor_config_free (monitor_config);
++          primary->monitor_configs = g_list_delete_link (primary->monitor_configs, l);
++        }
++      l = next;
++    }
++  if (!primary->monitor_configs)
++    goto failed;
++
++  for (unsigned int i = 0; i < virtuals->len; i++)
++    {
++      MetaMonitor *monitor = g_ptr_array_index (virtuals, i);
++      MetaMonitorMode *mode = meta_monitor_get_preferred_mode (monitor);
++      MetaLogicalMonitorConfig *logical;
++      float scale = viewport->scale;
++      int width, height, logical_width, logical_height, x, y;
++      int hint = -1;
++
++      if (!mode)
++        goto failed;
++
++      meta_monitor_mode_get_resolution (mode, &width, &height);
++      if (!meta_monitor_manager_is_scale_supported (monitor_manager,
++                                                    config->layout_mode,
++                                                    monitor, mode, scale))
++        scale = 1.0f;
++      scale_logical_monitor_width (config->layout_mode, scale, width, height,
++                                   &logical_width, &logical_height);
++
++      if (use_hints)
++        {
++          int slot = meta_monitor_get_native_remote_slot (monitor);
++
++          if (slot >= 0 && (unsigned int) slot < n_hints && !used[slot] &&
++              hints[slot].width == width && hints[slot].height == height)
++            hint = slot;
++          /* Without a usable slot, equal sizes keep creation order. */
++          for (unsigned int j = 0; j < n_hints && hint < 0; j++)
++            {
++              if (!used[j] && hints[j].width == width && hints[j].height == height)
++                hint = (int) j;
++            }
++          if (hint < 0)
++            goto failed;
++
++          used[hint] = TRUE;
++          x = native_logical_coordinate (hints[hint].x, viewport->scale);
++          y = native_logical_coordinate (hints[hint].y, viewport->scale);
++        }
++      else
++        {
++          x = row_x;
++          y = 0;
++          row_x += logical_width;
++        }
++
++      logical = g_new0 (MetaLogicalMonitorConfig, 1);
++      *logical = (MetaLogicalMonitorConfig) {
++        .layout = (MtkRectangle) {
++          .x = x,
++          .y = y,
++          .width = logical_width,
++          .height = logical_height,
++        },
++        .transform = MTK_MONITOR_TRANSFORM_NORMAL,
++        .scale = scale,
++        .monitor_configs = g_list_append (NULL,
++                                          create_monitor_config (monitor, mode,
++                                                                 META_COLOR_MODE_DEFAULT)),
++      };
++      logical_monitor_configs = g_list_append (logical_monitor_configs, logical);
++      min_x = MIN (min_x, x);
++      min_y = MIN (min_y, y);
++    }
++
++  for (GList *l = logical_monitor_configs; l; l = l->next)
++    {
++      MetaLogicalMonitorConfig *logical = l->data;
++
++      logical->layout.x -= min_x;
++      logical->layout.y -= min_y;
++    }
++
++  result = meta_monitors_config_new (monitor_manager, logical_monitor_configs,
++                                     config->layout_mode,
++                                     META_MONITORS_CONFIG_FLAG_NONE);
++  if (meta_verify_monitors_config (result, monitor_manager, &error))
++    return result;
++
++  meta_topic (META_DEBUG_BACKEND, "Native remote monitor layout rejected: %s",
++              error->message);
++  g_object_unref (result);
++  return NULL;
++
++failed:
++  g_list_free_full (logical_monitor_configs,
++                    (GDestroyNotify) meta_logical_monitor_config_free);
++  return NULL;
++}
++
++/* Keep the authenticated viewport and add every remote-only virtual monitor.
++ * Physical outputs remain viewport passengers. Client positions are used
++ * when every virtual monitor matches a hint; otherwise they form a row. */
++MetaMonitorsConfig *
++meta_monitor_config_manager_native_extend (MetaMonitorManager           *monitor_manager,
++                                          MetaMonitorsConfig           *config,
++                                          const MetaNativeExtraMonitor *hints,
++                                          unsigned int                  n_hints)
++{
++  g_autoptr (GPtrArray) virtuals = g_ptr_array_new ();
++  MetaLogicalMonitorConfig *viewport = NULL;
++  MetaMonitorsConfig *result;
++
++  for (GList *l = config ? config->logical_monitor_configs : NULL; l; l = l->next)
++    {
++      MetaLogicalMonitorConfig *logical = l->data;
++
++      if (logical->native_takeover_viewport)
++        viewport = logical;
++    }
++  if (!viewport)
++    return NULL;
++
++  for (GList *l = meta_monitor_manager_get_monitors (monitor_manager); l; l = l->next)
++    {
++      MetaMonitor *monitor = l->data;
++
++      if (meta_monitor_is_native_remote_only (monitor) &&
++          !native_monitor_is_passenger (viewport, monitor) &&
++          virtuals->len < META_NATIVE_MAX_EXTRA_MONITORS)
++        g_ptr_array_add (virtuals, monitor);
++    }
++  g_ptr_array_sort (virtuals, compare_native_virtual);
++
++  n_hints = MIN (n_hints, META_NATIVE_MAX_EXTRA_MONITORS);
++  result = native_extended_config (monitor_manager, config, viewport, virtuals,
++                                   hints, n_hints, TRUE);
++  if (!result)
++    result = native_extended_config (monitor_manager, config, viewport, virtuals,
++                                     hints, n_hints, FALSE);
++  if (!result)
++    {
++      /* Never lose the protected viewport because of an extra monitor. */
++      g_ptr_array_set_size (virtuals, 0);
++      result = native_extended_config (monitor_manager, config, viewport, virtuals,
++                                       hints, n_hints, FALSE);
++    }
++
++  return result;
++}
 --- a/src/backends/meta-monitor-config-store.c
 +++ b/src/backends/meta-monitor-config-store.c
 @@ -2610,6 +2610,11 @@
@@ -2562,7 +3183,7 @@
    *frame_rate = meta_monitor_mode_get_refresh_rate (mode);
  
    return TRUE;
-@@ -603,6 +605,33 @@
+@@ -603,6 +605,42 @@
      }
  
    color_state = meta_screen_cast_stream_src_get_color_state (src);
@@ -2593,6 +3214,146 @@
 +      g_object_unref (fb);
 +      return success;
 +    }
++
++  /* clutter_stage_paint_to_buffer() reads rect * scale pixels back, whatever
++   * the size of the stream buffer is. */
++  if (width != (int) roundf (logical_monitor->rect.width * scale) ||
++      height != (int) roundf (logical_monitor->rect.height * scale))
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Stale capture size");
++      return FALSE;
++    }
  
    if (!clutter_stage_paint_to_buffer (stage, &logical_monitor->rect, scale,
                                        data,
+@@ -980,6 +1018,32 @@
+   *out_y = (int) roundf (cursor_position.y);
+ }
+ 
++static gboolean
++meta_screen_cast_monitor_stream_src_is_cursor_metadata_valid (MetaScreenCastStreamSrc *src)
++{
++  MetaScreenCastMonitorStreamSrc *monitor_src =
++    META_SCREEN_CAST_MONITOR_STREAM_SRC (src);
++
++  if (!g_getenv ("MUTTER_NATIVE_TAKEOVER"))
++    return FALSE;
++
++  if (should_cursor_metadata_be_set (monitor_src))
++    {
++      int x, y;
++
++      if (!monitor_src->last_cursor_matadata.set ||
++          monitor_src->cursor_bitmap_invalid)
++        return FALSE;
++
++      get_cursor_position (monitor_src, &x, &y);
++
++      return (monitor_src->last_cursor_matadata.x == x &&
++              monitor_src->last_cursor_matadata.y == y);
++    }
++
++  return !monitor_src->last_cursor_matadata.set;
++}
++
+ static void
+ meta_screen_cast_monitor_stream_src_set_cursor_metadata (MetaScreenCastStreamSrc *src,
+                                                          struct spa_meta_cursor  *spa_meta_cursor)
+@@ -1191,6 +1255,8 @@
+     meta_screen_cast_monitor_stream_src_record_to_framebuffer;
+   src_class->queue_follow_up =
+     meta_screen_cast_monitor_stream_queue_follow_up;
++  src_class->is_cursor_metadata_valid =
++    meta_screen_cast_monitor_stream_src_is_cursor_metadata_valid;
+   src_class->set_cursor_metadata =
+     meta_screen_cast_monitor_stream_src_set_cursor_metadata;
+   src_class->get_formats =
+--- a/src/backends/meta-screen-cast-virtual-stream-src.c
++++ b/src/backends/meta-screen-cast-virtual-stream-src.c
+@@ -21,6 +21,7 @@
+ #pragma GCC diagnostic ignored "-Wfloat-conversion"
+ 
+ #include "config.h"
++#include "backends/meta-monitor-config-manager.h"
+ 
+ #include "backends/meta-screen-cast-virtual-stream-src.h"
+ 
+@@ -62,6 +63,7 @@
+   MetaVirtualMonitor *virtual_monitor;
+   GList *mode_infos;
+   gboolean has_preferred_scale;
++  int native_remote_slot_plus_one;
+   float preferred_scale;
+ 
+   gboolean cursor_bitmap_invalid;
+@@ -693,6 +695,20 @@
+   return mode_info;
+ }
+ 
++static void
++sync_native_remote_slot (MetaScreenCastVirtualStreamSrc *virtual_src,
++                         gboolean                        present)
++{
++  MetaOutput *output;
++
++  if (!virtual_src->virtual_monitor || !virtual_src->native_remote_slot_plus_one)
++    return;
++
++  output = meta_virtual_monitor_get_output (virtual_src->virtual_monitor);
++  meta_monitor_set_native_remote_slot (meta_output_get_name (output),
++                                       present ? virtual_src->native_remote_slot_plus_one - 1 : -1);
++}
++
+ static char *
+ generate_next_virtual_monitor_serial (void)
+ {
+@@ -769,6 +785,7 @@
+       return;
+     }
+   virtual_src->virtual_monitor = virtual_monitor;
++  sync_native_remote_slot (virtual_src, TRUE);
+ 
+   meta_monitor_manager_reload (monitor_manager);
+ }
+@@ -841,6 +858,25 @@
+ 
+       virtual_src->has_preferred_scale = TRUE;
+       virtual_src->preferred_scale = (float) scale;
++    }
++  else if (g_strcmp0 (key, "org.gnome.native-takeover.remote-slot") == 0 &&
++           g_getenv ("MUTTER_NATIVE_TAKEOVER"))
++    {
++      MetaScreenCastVirtualStreamSrc *virtual_src =
++        META_SCREEN_CAST_VIRTUAL_STREAM_SRC (src);
++      gint64 slot = g_ascii_strtoll (value, NULL, 10);
++
++      if (slot < 0 || slot >= META_NATIVE_MAX_EXTRA_MONITORS ||
++          virtual_src->native_remote_slot_plus_one == slot + 1)
++        return;
++
++      virtual_src->native_remote_slot_plus_one = (int) slot + 1;
++      if (virtual_src->virtual_monitor)
++        {
++          sync_native_remote_slot (virtual_src, TRUE);
++          meta_monitor_manager_reload (
++            meta_backend_get_monitor_manager (backend_from_src (src)));
++        }
+     }
+ }
+ 
+@@ -887,6 +923,7 @@
+         return FALSE;
+ 
+       virtual_src->virtual_monitor = virtual_monitor;
++      sync_native_remote_slot (virtual_src, TRUE);
+       meta_monitor_manager_reload (monitor_manager);
+     }
+ 
+@@ -966,6 +1003,7 @@
+ 
+   parent_class->dispose (object);
+ 
++  sync_native_remote_slot (virtual_src, FALSE);
+   g_clear_object (&virtual_src->virtual_monitor);
+   g_clear_list (&virtual_src->mode_infos,
+                 (GDestroyNotify) meta_virtual_mode_info_free);

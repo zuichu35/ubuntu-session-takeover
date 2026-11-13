@@ -29,6 +29,12 @@ class FakeBus:
             return type('Reply', (), {'unpack': lambda _: copy.deepcopy(self.current)})()
         serial, how, logical, props = args.unpack()
         self.calls.append((serial, how, logical, props))
+        if getattr(self, 'bump_before_apply', 0):
+            # A remote-only monitor disappeared between GetCurrentState and Apply.
+            self.bump_before_apply -= 1
+            self.current[0] += 1
+            raise GLib.Error('GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: '
+                             'The requested configuration is based on stale information')
         if serial != self.current[0]:
             raise RuntimeError('stale serial')
         if how == 1:
@@ -40,6 +46,7 @@ class FakeBus:
                                for x, y, scale, transform, primary, monitors in logical]
             self.current[0] += 1
             self.current[3].pop('native-takeover-size', None)
+            self.current[3].pop('native-takeover-extra', None)
             self.current[3].update(props)
             for group in logical:
                 for connector, mode, _ in group[5]:
@@ -162,6 +169,62 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(len(self.bus.calls), count)
         self.layout.restore()
         self.assertEqual(snapshot(self.bus.current), original)
+
+    def add_virtual_monitor(self, name='Meta-7', x=1920):
+        """A remote-only monitor that the compositor placed beside the viewport."""
+        spec = (name, 'MetaVendor', 'Virtual remote monitor', '0x000001')
+        self.bus.current[1].append((spec, [('1280x1024@60', 1280, 1024, 60., 1., [1.],
+                                             {'is-current': True})], {'native-takeover-remote-only': True}))
+        self.bus.current[2].append((x, 0, 1., 0, False, [spec], {}))
+        for _, _, props in self.bus.current[1][:-1]:
+            props['native-takeover-remote-only'] = False
+
+    def test_remote_only_monitors_are_never_saved_or_used_as_passengers(self):
+        caps = self.bus.current[3]
+        caps.update({'native-takeover-viewport-supported': True,
+                     'native-takeover-multimonitor-supported': True})
+        original = snapshot(self.bus.current)
+        self.layout.enter()
+        self.layout.resize(1920, 1080, extras=((1920, 0, 1280, 1024),))
+        self.assertEqual(self.bus.calls[-1][3]['native-takeover-extra'], [(1920, 0, 1280, 1024)])
+        self.add_virtual_monitor()
+        current = snapshot(self.bus.current)
+        self.assertEqual(len(current['logical']), 1)
+        self.assertNotIn('Meta-7', current['identities'])
+        self.layout.resize(2560, 1440, extras=((2560, 0, 1280, 1024),))
+        connectors = [o[0] for o in self.bus.calls[-1][2][0][5]]
+        self.assertEqual(sorted(connectors), ['DP-3', 'HDMI-4'])
+        self.assertEqual(len(self.bus.calls[-1][2]), 1)
+        self.layout.restore()
+        self.assertEqual(snapshot(self.bus.current)['logical'], original['logical'])
+        self.assertNotIn('native-takeover-extra', self.bus.calls[-1][3])
+
+    def test_restore_retries_when_remote_only_monitor_changes_serial(self):
+        self.bus.current[3]['native-takeover-viewport-supported'] = True
+        original = snapshot(self.bus.current)
+        self.layout.enter()
+        self.layout.resize(1920, 1080)
+        self.bus.bump_before_apply = 2
+        self.layout.restore()
+        self.assertFalse(self.path.exists())
+        self.assertEqual(snapshot(self.bus.current)['logical'], original['logical'])
+
+    def test_scale_change_keeps_extra_monitors(self):
+        self.bus.current[3].update({'native-takeover-viewport-supported': True,
+                                    'native-takeover-scale-supported': True,
+                                    'native-takeover-multimonitor-supported': True})
+        self.layout.enter()
+        self.layout.resize(1920, 1080, extras=((0, 1080, 1920, 1080),))
+        self.layout.set_scale(125)
+        self.assertEqual(self.bus.calls[-1][2][0][2], 1.25)
+        self.assertEqual(self.bus.calls[-1][3]['native-takeover-extra'], [(0, 1080, 1920, 1080)])
+
+    def test_old_compositor_ignores_extra_monitors(self):
+        self.bus.current[3]['native-takeover-viewport-supported'] = True
+        target, _ = remote_monitor(self.bus.current, 1920, 1080, 100, ((1920, 0, 1920, 1080),))
+        self.assertNotIn('native-takeover-extra', target['properties'])
+        self.assertEqual(arguments(1, target).unpack()[3], {'native-takeover-size': (1920, 1080),
+                                                            'layout-mode': 1})
 
     def test_exact_viewport_needs_capability_and_rejects_invalid_size(self):
         self.assertEqual(remote_monitor(self.bus.current, 2560, 1440)[1], (1920, 1080))

@@ -39,7 +39,7 @@ def launch_files():
     unit = Path('/usr/lib/systemd/user/org.gnome.Shell@.service').read_text()
     commands = [l.split('=', 1)[1] for l in unit.splitlines() if l.startswith('ExecStart=')]
     if len(commands) != 1 or '/usr/bin/gnome-shell' not in shlex.split(commands[0]):
-        raise RuntimeError('无法识别系统 GNOME Shell 启动命令，未修改配置。')
+        raise RuntimeError('Could not identify the system GNOME Shell launch command; configuration unchanged.')
     # Use the same unit name as the development version so conflicting installs
     # are detected and cannot silently replace one another.
     return {
@@ -53,12 +53,15 @@ def launch_files():
             'ExecStart=/usr/bin/python3 ' + str(ROOT / 'scripts/native-session.py') + '\n'
             'KillMode=control-group\nTimeoutStopSec=20\n',
         Path.home() / '.local/share/applications/ubuntu-native-takeover-settings.desktop':
-            '[Desktop Entry]\nType=Application\nName=远程桌面设置\n'
-            'Comment=调整远程接管桌面的缩放比例\n'
+            '[Desktop Entry]\nType=Application\nName=UST\nGenericName=Ubuntu Session Takeover\n'
+            'Comment=Live state, scale and monitors of the remotely taken-over desktop\n'
             'Exec=/usr/bin/python3 ' + str(ROOT / 'scripts/remote-settings.py') + '\n'
-            'Icon=preferences-desktop-display\nTerminal=false\nCategories=Settings;DesktopSettings;\n',
+            'Icon=preferences-desktop-display\nTerminal=false\nCategories=Settings;DesktopSettings;\n'
+            'Keywords=ust;takeover;remote;rdp;scale;monitor;\n',
+        Path.home() / '.local/bin/ust':
+            '#!/bin/sh\nexec /usr/bin/python3 ' + str(ROOT / 'scripts/remote-settings.py') + ' "$@"\n',
         Path.home() / '.config/autostart/ubuntu-native-takeover.desktop':
-            '[Desktop Entry]\nType=Application\nName=原生桌面远程接管\n'
+            '[Desktop Entry]\nType=Application\nName=Native Desktop Remote Takeover\n'
             'Exec=/usr/bin/systemctl --user start ubuntu-native-takeover.service\n'
             'OnlyShowIn=GNOME;\nX-GNOME-Autostart-enabled=true\n',
     }
@@ -66,10 +69,10 @@ def launch_files():
 
 def setup(args):
     if os.getuid() == 0:
-        raise RuntimeError('请以桌面用户运行 setup，不要使用 sudo。')
+        raise RuntimeError('Run setup as the desktop user; do not use sudo.')
     report = check()
     if not report['compatible']:
-        raise RuntimeError('安装包未通过当前系统的兼容性验证：' + json.dumps(report, ensure_ascii=False))
+        raise RuntimeError('The package did not pass the compatibility check for this system: ' + json.dumps(report, ensure_ascii=False))
     files = launch_files()
     conflicts = [str(p) for p in files if p.exists()]
     if (CONFIG / 'install.json').exists():
@@ -80,13 +83,13 @@ def setup(args):
                           'restart_desktop': False}, ensure_ascii=False, indent=2))
         return
     if conflicts:
-        raise RuntimeError('已有原生接管配置。请先使用原版本的回退入口，避免覆盖：' + ', '.join(conflicts))
-    username = args.username or input('RDP 用户名：').strip()
+        raise RuntimeError('Native takeover configuration already exists. Use the previous version’s rollback entry first to avoid overwriting it: ' + ', '.join(conflicts))
+    username = args.username or input('RDP username: ').strip()
     if not username or '\n' in username:
-        raise RuntimeError('用户名不能为空。')
-    password = getpass.getpass('设置 RDP 密码：')
-    if not password or password != getpass.getpass('再次输入密码：'):
-        raise RuntimeError('两次密码不一致或密码为空，未修改配置。')
+        raise RuntimeError('Username must not be empty.')
+    password = getpass.getpass('Set RDP password: ')
+    if not password or password != getpass.getpass('Re-enter password: '):
+        raise RuntimeError('Passwords do not match or are empty; configuration unchanged.')
     os.umask(0o077)
     for directory in (CONFIG, DATA, DATA / 'rdp'):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -102,13 +105,13 @@ def setup(args):
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         key.chmod(0o600)
     elif not cert.exists() or not key.exists():
-        raise RuntimeError('证书或私钥缺失，未覆盖现有证书文件。')
+        raise RuntimeError('Certificate or private key is missing; existing certificate files were not overwritten.')
     result = subprocess.run([str(ROOT / 'build/grd-prefix/bin/grdctl'), '--headless',
                              'rdp', 'set-credentials', username], input=password + '\n',
                             env=env, text=True, capture_output=True)
     del password
     if result.returncode:
-        raise RuntimeError('保存 RDP 凭据失败，未启用服务。')
+        raise RuntimeError('Failed to save RDP credentials; service not enabled.')
     for schema, name, value in [('org.gnome.desktop.remote-desktop.rdp', 'tls-cert', str(cert)),
                                ('org.gnome.desktop.remote-desktop.rdp', 'tls-key', str(key)),
                                ('org.gnome.desktop.remote-desktop.rdp', 'view-only', 'false'),
@@ -123,31 +126,33 @@ def setup(args):
     for path, text in files.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
+        if text.startswith('#!'):
+            path.chmod(0o755)
     subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
-    print('已配置。保存工作后注销并重新登录 Ubuntu，再连接 本机IP:3392。当前桌面未重启。')
+    print('Configured. Save your work, log out and log back in to Ubuntu, then connect to <this-machine-IP>:3392. The current desktop was not restarted.')
 
 
 def check_removal():
     if LOGIN_CONFIG.exists():
-        raise RuntimeError('请先关闭系统登录入口：sudo python3 /opt/ubuntu-native-takeover/scripts/disable-login.py')
+        raise RuntimeError('Disable the system login entry first: sudo python3 /opt/ubuntu-native-takeover/scripts/disable-login.py')
     blocked = []
     for account in pwd.getpwall():
         p = Path(account.pw_dir) / '.config/systemd/user/org.gnome.Shell@ubuntu.service.d/90-native-takeover.conf'
         if p.is_file() and '/opt/ubuntu-native-takeover/' in p.read_text():
             blocked.append(account.pw_name)
     if blocked:
-        raise RuntimeError('以下用户仍启用了接管，请先以各用户运行 ubuntu-native-takeover disable：' + ', '.join(blocked))
+        raise RuntimeError('These users still have takeover enabled; run ubuntu-native-takeover disable as each of them first: ' + ', '.join(blocked))
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Ubuntu 原生会话远程接管（实验版）')
+    parser = argparse.ArgumentParser(description='Remote takeover of the native Ubuntu session (experimental)')
     sub = parser.add_subparsers(dest='command', required=True)
-    sub.add_parser('check', help='校验版本、安装文件和动态库')
-    setup_parser = sub.add_parser('setup', help='交互配置 RDP 凭据，下次登录启用')
+    sub.add_parser('check', help='Verify version, installed files and shared libraries')
+    setup_parser = sub.add_parser('setup', help='Interactively configure RDP credentials; enabled at next login')
     setup_parser.add_argument('--username')
     setup_parser.add_argument('--dry-run', action='store_true')
     sub.add_parser('status')
-    sub.add_parser('disable', help='回退启动入口，不注销当前桌面')
+    sub.add_parser('disable', help='Roll back the startup entry without logging out the current desktop')
     sub.add_parser('check-removal')
     args = parser.parse_args()
     if args.command == 'check':
@@ -158,7 +163,7 @@ def main():
         setup(args)
     elif args.command == 'disable':
         if os.getuid() == 0:
-            raise RuntimeError('请以原桌面用户运行 disable，不要使用 sudo。')
+            raise RuntimeError('Run disable as the original desktop user; do not use sudo.')
         subprocess.run(['/usr/bin/python3', str(ROOT / 'scripts/disable-native.py')], check=True)
     elif args.command == 'status':
         subprocess.run(['systemctl', '--user', 'status', '--no-pager', 'ubuntu-native-takeover.service'], check=False)

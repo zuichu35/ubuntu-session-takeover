@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from takeover.session_health import backend_listening, GatewayRegistration, Watchdog
 from takeover.greeter_config import grd_environment as greeter_grd_environment
 from takeover.login_gateway import boot_guard_present
+from takeover.remote_settings import load_multi_monitor
 from takeover.startup_policy import confirmed_system_fallback
 from takeover.startup_guard import (READY_STATES, STARTUP_STATES, LocalReclaimRejected,
                                     finish_local_reclaim, wait_startup_ready)
@@ -39,6 +40,15 @@ def recover_monitor_layout_before_broker(state):
     # The standalone recovery tool waits for local privacy state. During
     # ready-guarded startup, the broker's existing restore path safely restores
     # a journal while the physical privacy barrier stays active.
+
+
+def native_multimonitor_supported(bus):
+    try:
+        state = bus.call_sync('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+            'org.gnome.Mutter.DisplayConfig', 'GetCurrentState', None, None, 0, 3000, None).unpack()
+    except GLib.Error:
+        return False
+    return state[3].get('native-takeover-multimonitor-supported') is True
 
 
 def retire_legacy_services(enabled=False):
@@ -147,12 +157,24 @@ def main():
         retire_legacy_services('--retire-legacy-services' in sys.argv)
         grd_env = dict(env, DCONF_PROFILE=str(CONFIG / 'dconf-profile'), XDG_DATA_HOME=str(DATA / 'rdp'),
                        GRD_TAKEOVER_SOCKET=str(gate), GRD_NATIVE_TAKEOVER='1',
-                       LD_LIBRARY_PATH=str(ROOT / 'vendor/grd-deps/root/usr/lib/x86_64-linux-gnu'))
+                       LD_LIBRARY_PATH=str(ROOT / 'build/grd-prefix/lib/x86_64-linux-gnu'))
         if gateway_enabled:
             grd_env['GRD_NATIVE_LOOPBACK'] = '1'
         if greeter:
             grd_env.update(greeter_env)
             grd_env['GRD_NATIVE_GREETER'] = '1'
+        else:
+            # Extra client monitors become remote-only virtual monitors. The
+            # GDM greeter always stays a single screen.
+            try:
+                multi_monitor = load_multi_monitor()
+            except (OSError, ValueError) as error:
+                print(json.dumps({'event': 'native-multimonitor-disabled', 'reason': str(error)}), flush=True)
+                multi_monitor = False
+            # A compositor started before this update keeps its viewport but
+            # cannot place remote-only monitors; stay single-screen there.
+            if multi_monitor and native_multimonitor_supported(user_bus):
+                grd_env['GRD_NATIVE_MULTIMON'] = '1'
         for key in ('GSETTINGS_BACKEND', 'GSETTINGS_SCHEMA_DIR', 'MUTTER_NATIVE_TAKEOVER',
                     'MUTTER_NATIVE_TAKEOVER_TEST'):
             grd_env.pop(key, None)

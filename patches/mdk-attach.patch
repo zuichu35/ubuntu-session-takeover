@@ -228,22 +228,22 @@
        <item>
 -        <attribute name="label" translatable="yes">_About Mutter Development Kit</attribute>
 -        <attribute name="action">app.about</attribute>
-+        <attribute name="label">切换全屏</attribute>
++        <attribute name="label">Toggle Fullscreen</attribute>
 +        <attribute name="action">app.fullscreen</attribute>
 +      </item>
 +      <item>
-+        <attribute name="label">将系统快捷键发送到共享桌面</attribute>
++        <attribute name="label">Send System Shortcuts to Shared Desktop</attribute>
 +        <attribute name="action">app.toggle_inhibit_system_shortcuts</attribute>
 +      </item>
 +      <item>
-+        <attribute name="label">返回本机桌面（保留工作）</attribute>
++        <attribute name="label">Return to Local Desktop (Keep Work)</attribute>
 +        <attribute name="action">app.leave</attribute>
        </item>
      </section>
    </menu>
    <template class="MdkMainWindow" parent="MdkWindow">
 -    <property name="title" translatable="yes">Mutter Development Kit</property>
-+    <property name="title" translatable="yes">共享工作桌面</property>
++    <property name="title" translatable="yes">Shared Working Desktop</property>
      <child type="titlebar">
        <object class="GtkHeaderBar" id="headerbar">
          <child type="end">

@@ -73,7 +73,7 @@ void meta_native_local_lock_begin (ClutterActor *stage, struct xkb_keymap *keyma
   running = TRUE;
   recovery_mode = FALSE;
   retry_after = 0;
-  status_text = "输入本机密码，按 Enter 接回桌面";
+  status_text = "Enter the local password and press Enter to reclaim the desktop";
   (void) mlock (password, sizeof password);
   ticker = g_timeout_add_seconds (10, tick, NULL);
   redraw ();
@@ -100,14 +100,14 @@ static void auth_done (GObject *source, GAsyncResult *result, gpointer data)
       busy = FALSE;
       if (ok)
         {
-          status_text = "验证成功，正在接回桌面…";
+          status_text = "Verified, reclaiming the desktop…";
           redraw ();
           if (on_verified) on_verified ();
         }
       else
         {
           retry_after = g_get_monotonic_time () + 2 * G_USEC_PER_SEC;
-          status_text = "密码错误或认证不可用，请稍后重试";
+          status_text = "Wrong password or authentication unavailable, try again later";
           redraw ();
         }
     }
@@ -123,7 +123,7 @@ static void submit (void)
   if (!helper || !g_path_is_absolute (helper))
     {
       clear_password ();
-      status_text = "认证服务未就绪，请从远程端断开连接";
+      status_text = "Authentication service not ready, disconnect from the remote side";
       redraw ();
       return;
     }
@@ -134,7 +134,7 @@ static void submit (void)
   if (!authentication)
     {
       clear_password ();
-      status_text = "认证服务无法启动，请从远程端断开连接";
+      status_text = "Authentication service failed to start, disconnect from the remote side";
       redraw ();
       return;
     }
@@ -145,7 +145,7 @@ static void submit (void)
   clear_password ();
   if (!sent) g_subprocess_force_exit (authentication);
   busy = TRUE;
-  status_text = "正在验证本机密码…";
+  status_text = "Verifying the local password…";
   AuthAttempt *attempt = g_new0 (AuthAttempt, 1);
   attempt->generation = generation;
   g_subprocess_wait_async (authentication, NULL, auth_done, attempt);
@@ -213,22 +213,22 @@ void meta_native_local_lock_paint (ClutterStageView *view)
       cairo_paint (cr);
       GDateTime *now = g_date_time_new_now_local ();
       char *clock = g_date_time_format (now, "%H:%M");
-      char *date = g_date_time_format (now, "%Y年%m月%d日");
+      char *date = g_date_time_format (now, "%B %-d, %Y");
       label (cr, clock, 76, 30, 1);
       label (cr, date, 20, 130, .75);
       label (cr, g_get_user_name (), 30, 205, 1);
-      label (cr, recovery_mode ? "请验证本机密码以接回桌面" : "远程会话正在使用此电脑", 18, 255, .72);
+      label (cr, recovery_mode ? "Verify the local password to reclaim the desktop" : "A remote session is using this computer", 18, 255, .72);
       cairo_set_source_rgb (cr, .17, .18, .22);
       cairo_rectangle (cr, 200, 315, 400, 52);
       cairo_fill (cr);
       GString *dots = g_string_new (NULL);
       for (int i = 0; i < MIN (g_utf8_strlen (password, -1), 24); i++) g_string_append (dots, "●");
-      label (cr, *dots->str ? dots->str : "密码", 19, 326, *dots->str ? 1 : .5);
+      label (cr, *dots->str ? dots->str : "Password", 19, 326, *dots->str ? 1 : .5);
       g_string_free (dots, TRUE);
       label (cr, status_text, 17, 395, .85);
       if (xkb_state_mod_name_is_active (key_state, XKB_MOD_NAME_CAPS, XKB_STATE_MODS_LOCKED))
-        label (cr, "Caps Lock 已开启", 15, 435, .7);
-      label (cr, recovery_mode ? "桌面和应用将继续保留" : "验证成功后，远程连接将断开", 15, 480, .5);
+        label (cr, "Caps Lock is on", 15, 435, .7);
+      label (cr, recovery_mode ? "Your desktop and apps will be kept" : "The remote connection will end after verification", 15, 480, .5);
       cairo_surface_flush (surface);
       g_clear_object (&texture);
       texture = COGL_TEXTURE (cogl_texture_2d_new_from_data (cogl, 800, 600,

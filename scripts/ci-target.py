@@ -14,7 +14,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / 'build/target-ci'
-PROFILE = 'ubuntu-26.04-amd64-gnome-50.1-updates-20261029'
+PROFILE = 'ubuntu-26.04-amd64-gnome-50.1-host-scale-20261113'
 
 
 def digest(path):
@@ -114,6 +114,9 @@ def main():
     scenarios = [('startup', ['tests/native_startup_lock.py']),
                  ('shell', ['tests/native_integration.py', '--shell', '--boot-guard']),
                  ('desktop', ['tests/native_integration.py']),
+                 ('multimon', ['tests/native_integration.py', '--multimon']),
+                 ('scale', ['tests/native_integration.py', '--adaptive', '--exact-viewport', '--remote-scale',
+                            '--two-monitors']),
                  ('gateway', ['tests/native_integration.py', '--gateway-handover-probe']),
                  ('gateway-reject', ['tests/native_integration.py', '--gateway-handover-probe', '--reject-handover'])]
     for name, arguments in scenarios:
@@ -132,12 +135,17 @@ def main():
     startup = json.loads((WORK / 'startup/startup-lock/result.json').read_text())
     gateway = json.loads((WORK / 'gateway/greeter-integration-result.json').read_text())
     rejection = json.loads((WORK / 'gateway-reject/greeter-auth-rejection-result.json').read_text())
+    multimon = json.loads((WORK / 'multimon/native-integration-result.json').read_text())
     assert shell['startup_guard_verified'] and shell['rdp_input_to_original_app']
     assert shell['verified_local_reclaim_revokes_remote_without_second_password']
     assert startup['failed_reclaim']['wrong_password_preserves_privacy']
     assert startup['late_callback']['late_lock_callbacks_cannot_reactivate_native_privacy_after_local_auth']
     assert gateway['automatic_rdp_handover_verified'] and gateway['fresh_client_handshake_waited_for_target']
     assert rejection['rdstls_wrong_password_rejected']
+    assert all(multimon.get(key) for key in (
+        'multi_monitor_verified', 'viewport_and_extra_monitor_both_painted',
+        'remote_only_monitor_not_blackened', 'physical_views_unchanged_with_extra_monitor',
+        'rdp_input_on_extra_monitor', 'local_reclaim_removes_extra_monitor'))
     # The real Shell process must have loaded our private libraries, not the
     # system Mutter that happens to share its ABI. The harness reads its maps.
     for relative in profile['tested_runtime']:
@@ -160,12 +168,14 @@ def main():
     receipt = {'schema': 1, 'scope': 'target-shell-integration', 'profile_id': PROFILE,
         'manifest_sha256': manifest_hash, 'target': manifest['built_for'],
         'cases': {name: 'passed' for name in ('target-shell-startup', 'desktop-rdp',
-                 'startup-dual-lock', 'local-auth-reclaim', 'gateway-handover')},
+                 'startup-dual-lock', 'local-auth-reclaim', 'gateway-handover',
+                 'multi-monitor')},
         'evidence': evidence, 'tested_binaries': tested_hashes,
         'limitations': ['Headless virtual outputs and CPU rendering',
             'Private fake logind/GDM; real GNOME Shell ScreenShield',
             'Test authentication helper; real PAM and GDM cold boot unverified',
             'Clipboard channel disabled in CI; clipboard and file transfer unverified',
+            'Multi-monitor verified with the FreeRDP X11 client on two RandR monitors; Windows mstsc multimon unverified',
             'No physical GPU/display/input or Windows/macOS client acceptance']}
     facts = collect_snapshot(ROOT, profile, required_owner=os.getuid(),
                              profile_sha256=manifest['profile_sha256'])

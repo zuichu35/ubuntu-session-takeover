@@ -65,7 +65,7 @@ def main():
             time.sleep(.1)
         reply = request('LOCAL')
         if reply != 'OK':
-            raise RuntimeError('请先用 Ubuntu 密码解锁本地桌面，再打开共享工作桌面。')
+            raise RuntimeError('Unlock the local desktop with your Ubuntu password first, then open the shared working desktop.')
     elif args.action == 'status':
         print(request('STATUS'))
     elif args.action in ('grd', 'rdp'):

@@ -6,6 +6,9 @@ struct libinput_event;
 struct _MetaLogicalMonitor;
 gboolean meta_native_privacy_get_viewport_size (struct _MetaLogicalMonitor *monitor,
                                                 int *width, int *height);
+/* FALSE only for an extra remote-only monitor beside an active viewport.
+ * Unknown views, and every view without a viewport, are physical. */
+gboolean meta_native_privacy_view_is_physical (ClutterStageView *view);
 void meta_native_privacy_init (MetaContext *context);
 gboolean meta_native_privacy_active (void);
 gboolean meta_native_privacy_has_lease (void);

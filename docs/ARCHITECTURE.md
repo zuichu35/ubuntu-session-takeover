@@ -1,44 +1,52 @@
-# 原生会话接管与登录交接
+# Native Session Takeover and Login Handover
 
-## 已登录桌面
+## Logged-in desktop
 
-GRD 完成 RDP 认证后向 broker 申请独占租约。Mutter 隔离原始物理输入，清理已交付的按键/按钮状态，等待各物理输出确认隐私帧，再允许远程输入和离屏采集。
+After GRD completes RDP authentication it requests an exclusive lease from the broker. Mutter isolates the raw physical input, clears key/button state that has already been delivered, waits for every physical output to confirm a privacy frame, and only then allows remote input and off-screen capture.
 
-物理密码界面绘制到物理 framebuffer，不作为桌面场景中的 actor，因此不进入远程采集。正确本机密码通过 PAM 后，先同步关闭远程会话、撤销捕获与输入，再恢复物理访问。普通远程断开仍需确认 GNOME ScreenSaver 与 logind `LockedHint` 都已锁定。
+The physical password screen is drawn into the physical framebuffer and is not an actor in the desktop scene, so it never enters remote capture. After the correct local password passes PAM, the remote session is closed synchronously and capture and input are revoked, and only then is physical access restored. A plain remote disconnect still requires confirming that both GNOME ScreenSaver and logind `LockedHint` are locked.
 
-## 开机或注销后的登录
+## Login after boot or logout
 
-1. 系统网关通过受校验的 greeter 端点转发到 3394。动态 greeter 身份由 NSS 主组和实际 logind 会话确认，不依赖固定 UID 或用户名前缀。
-2. RDP 认证后的 greeter 租约先建立 root 管理的启动保护标记，再允许输入实际 GDM 登录画面。
-3. GDM/PAM 创建物理用户会话。新 Mutter 从首帧保留隐私保护；独立 guard 服务及监督程序协调锁定确认，不阻塞 Shell 的启动完成。
-4. 网关发现配置用户的新物理会话时，尽早通知仍存活的 greeter 发 RDP 重定向。客户端通过 3392 重新连接，并有界等待桌面端点准备完成。
-5. 桌面端点就绪后重新执行 RDP 认证与接管。源 greeter 已退出时，也不会把旧的 TLS 流改接到桌面。
+1. The system gateway forwards to 3394 through a validated greeter endpoint. The dynamic greeter identity is confirmed through the NSS primary group and the actual logind session, and does not depend on a fixed UID or a username prefix.
+2. The greeter lease obtained after RDP authentication first creates a root-managed startup-protection marker, and only then allows input to the actual GDM login screen.
+3. GDM/PAM creates the physical user session. The new Mutter keeps privacy protection from the first frame; a separate guard service and supervisor coordinate lock confirmation without blocking Shell startup from completing.
+4. When the gateway sees a new physical session for the configured user, it notifies the still-living greeter as early as possible to send an RDP redirect. The client reconnects through 3392, and waits, within bounds, for the desktop endpoint to become ready.
+5. Once the desktop endpoint is ready, RDP authentication and takeover are performed again. Even if the source greeter has already exited, the old TLS stream is never re-attached to the desktop.
 
-GDM 可以自行停止 greeter，不能假设它会等待自定义后端。客户端重连/握手超时仍是实机验收内容。
+GDM may stop the greeter on its own, and it cannot be assumed to wait for a custom backend. Client reconnect/handshake timeouts remain part of live acceptance.
 
-## 隐私状态
+## Privacy states
 
-| 状态 | 含义 |
+| State | Meaning |
 |---|---|
-| `local` | 本地可用，没有当前远程租约 |
-| `boot-guard` | 新会话已从首帧保护，尚未开始锁确认 |
-| `startup-locking` | 正在独立核对 ScreenSaver 与 LockedHint |
-| `ready-guarded` | 双锁已确认，仍保留物理保护，等待认证接管 |
-| `startup-failed` | 启动确认超时，保留保护并显示本地密码恢复入口 |
-| `blanking` | 已认证接管正在等待物理隐私帧确认 |
-| `remote` | 远程租约生效 |
-| `locking` | 普通远程结束后的锁定恢复 |
+| `local` | Locally usable, no current remote lease |
+| `boot-guard` | New session is protected from the first frame; lock confirmation has not started |
+| `startup-locking` | ScreenSaver and LockedHint are being checked independently |
+| `ready-guarded` | Both locks confirmed; physical protection is kept while waiting for an authenticated takeover |
+| `startup-failed` | Startup confirmation timed out; protection is kept and a local password recovery entry is shown |
+| `blanking` | Authenticated takeover is waiting for physical privacy-frame confirmation |
+| `remote` | Remote lease is in effect |
+| `locking` | Lock recovery after an ordinary remote session ended |
 
-`GetStatus` 提供两项锁状态是否已知、各自值、请求状态、耗时、原因、会话路径及本地认证状态。未知和 false 不应混为一谈。
+`GetStatus` reports whether each of the two lock states is known, their values, the request state, elapsed time, reason, session path and local authentication state. Unknown and false must not be conflated.
 
-启动锁 30 秒未完成时进入 `startup-failed`，后台低频重试仍可恢复；本地输入的密码不会被重试清空。正确本机认证先禁止所有远程访问，再尝试解除 Shell 锁定，最多等待 10 秒后恢复本地输入。此时 root 网关独立核验查询用户、运行中 Shell PID、会话、认证标记及远程禁止状态，才清理启动保护；客户端提交的布尔声明不构成认证证据。
+If the startup lock is not completed within 30 seconds the state becomes `startup-failed`; low-frequency background retries can still recover it, and a password typed locally is not cleared by retries. Correct local authentication first forbids all remote access, then tries to release the Shell lock, waits at most 10 seconds, and restores local input. At that point the root gateway independently verifies the queried user, the running Shell PID, the session, the authentication marker and the remote-forbidden state before clearing startup protection; a boolean claim submitted by a client is not authentication evidence.
 
-异步状态观察使用代际编号取消过期结果，本地 PAM 回调还绑定当前认证子进程。新租约不能被前一次认证的迟到结果接回。
+Asynchronous state observation uses generation numbers to cancel stale results, and the local PAM callback is also bound to the current authentication child process. A new lease cannot be reclaimed by a late result from a previous authentication.
 
-## 故障处理
+## Failure handling
 
-监督程序仅等待明确的启动状态；不会接管另一个控制者的 `remote`、`blanking` 或普通 `locking`。网关短暂不可用时保留当前后端并重注册；子进程退出则报告失败。网关查询、握手缓冲、待连接数量和停止过程有界，注销中的旧会话不阻挡新 greeter。
+The supervisor waits only for explicit startup states; it does not take over `remote`, `blanking` or an ordinary `locking` belonging to another controller. When the gateway is briefly unavailable the current backend is kept and re-registered; if a child process exits, failure is reported. Gateway queries, handshake buffers, the number of pending connections and the stop procedure are all bounded, and an old session that is logging out does not block a new greeter.
 
-显示布局恢复记录属于用户运行目录，临时修改不写入永久显示配置。显示器身份变化时保留记录并报告，避免把旧参数套到其他设备。
+Display-layout restore records belong to the user's runtime directory, and temporary changes are not written to the permanent display configuration. When a monitor's identity changes the record is kept and reported, so old parameters are never applied to a different device.
 
-`takeover/broker.py`、`workspace.py` 等早期共享桌面模块和部分测试辅助文件保留用于历史回归与源码参考；当前原生 3392 数据路径不使用旧的本地 RDP 查看器。
+## Remote display and scale
+
+GRD sends the broker one line per layout: `REMOTE|LAYOUT|RESIZE w h [x y w h]... [S<percent>]`. The first size is the viewport, each further group one extra client monitor, and the optional last field the desktop scale the RDP client announced (`DesktopScaleFactor`, taken from the primary monitor on a display-control update). The broker rounds it to 100, 125, 150, 175 or 200% and applies it when the lease starts and whenever the announced value changes; an unchanged value is ignored, so a scale chosen by hand survives resizing the client window. Without the field the saved setting is used (the greeter: 100%).
+
+`SCALE <percent>` on the same socket changes the scale of a running session and saves it as the fallback; `STATUS` returns one JSON line with the lease state plus `viewport`, `scale_percent`, `remote_only_monitors`, `client_scale` and what the running compositor supports. The UST dashboard (`takeover/remote_settings_ui.py`) uses only these two commands.
+
+While a lease holds the viewport, Mutter treats an `ApplyMonitorsConfig` call that does not come from the broker (GNOME Settings, `gdctl`) as a request about the remote desktop: with exactly one logical monitor, and the same monitors and modes as now, its scale is applied to the viewport as a temporary configuration (quarter steps, 1.0 to 2.0); anything else is rejected with an error. The broker marks its own restore with `native-takeover-release`, so giving the viewport up is never mistaken for such a request. Screen-cast read-back skips a frame whose buffer no longer matches the stream size, which is what crashed the compositor on a scale change before.
+
+Early shared-desktop modules such as `takeover/broker.py` and `workspace.py`, and some test helper files, are kept for historical regression and source reference; the current native 3392 data path does not use the old local RDP viewer.

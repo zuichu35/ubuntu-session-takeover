@@ -1,50 +1,52 @@
-# 部署及维护边界
+# Deployment and Maintenance Boundaries
 
-当前发布的是实验性源码。新机器上的完整初始部署流程尚未整理为受支持的一键安装器，本仓库没有可直接安装的 Release 二进制附件。
+What is currently published is experimental source. A complete initial deployment procedure for a new machine has not been turned into a supported one-click installer, and this repository has no installable Release binary attachments.
 
-先阅读 [构建说明](BUILDING.md)，在匹配 GNOME/Mutter ABI 的测试环境构建并运行 [分层测试](TESTING.md)。构建输出、ABI 记录、TLS 与 RDP 凭据应由目标机器自行产生，不从开发机器复制。
+First read the [build instructions](BUILDING.md), build in a test environment that matches the GNOME/Mutter ABI, and run the [layered tests](TESTING.md). Build output, ABI records, TLS and RDP credentials must be produced by the target machine itself and not copied from the development machine.
 
-## 工具分类
+## Tool categories
 
-| 工具 | 使用范围 |
+| Tool | Scope of use |
 |---|---|
-| `check-native-health.py` | 默认只读；`--tls` 仅在空闲时进行协议探测，不能证明桌面登录成功 |
-| `check-compatibility.py`、`native-shell.py --check` | 只读检查精确兼容配置、ABI、文件归属、最终产物和目标测试收据 |
-| `install-native.py` | 历史用户目录安装器已禁用；不满足新启动门禁的 root 管理要求 |
-| `finalize-compatibility-bundle.py` | 最终产物测试通过后封装两份兼容收据；禁止同时改变既有包文件 |
-| `package-native.py`、`packaging/control.py` | 实验打包/交互设置工具；必须先审核依赖、测试证据与目标布局 |
-| `install-greeter-fix.py`、`install-greeter-startup-fix.py`、`install-handover-fix.py` | 有精确旧清单和原始备份的既有安装升级，缺失前置状态应拒绝执行 |
-| `build-greeter-fix.py`、`build-handover-fix.py` | 对应维护 bundle 的组包工具；后者依赖旧 bundle，不能用于空目录 bootstrap |
-| `disable-native.py`、`disable-login.py` | 显式回退入口，会停止或切换相关 RDP 后端；先阅读具体脚本与安装记录 |
-| `reload-native-idle.py` | 等待后端空闲后重载 RDP，不能更新运行中的 Mutter |
-| `tests/live_power_save.py` | 需要显式确认的实机测试，会改变显示电源与租约状态；不属于默认 CI |
+| `check-native-health.py` | Read-only by default; `--tls` performs a protocol probe only when idle and cannot prove a desktop login succeeded |
+| `check-compatibility.py`, `native-shell.py --check` | Read-only checks of the exact compatibility profile, ABI, file ownership, final artifacts and target test receipts |
+| `install-native.py` | The historical user-directory installer is disabled; it does not meet the root-managed requirements of the new startup gate |
+| `finalize-compatibility-bundle.py` | Seals the two compatibility receipts after the final artifact tests pass; must not change existing package files at the same time |
+| `package-native.py`, `packaging/control.py` | Experimental packaging / interactive setup tools; dependencies, test evidence and target layout must be reviewed first |
+| `install-greeter-fix.py`, `install-greeter-startup-fix.py`, `install-handover-fix.py` | Upgrades of an existing install with an exact old manifest and original backups; they must refuse to run if the prerequisite state is missing |
+| `build-greeter-fix.py`, `build-handover-fix.py` | Bundle assemblers for the corresponding maintenance bundles; the latter depends on the old bundle and cannot be used to bootstrap an empty directory |
+| `deploy-runtime.py` | Host maintenance (root): copies a `dist/runtime-*` bundle beside `/opt/ubuntu-native-takeover`, checks every file against `package-files.json`, exchanges the two directories atomically and keeps the replaced one as `.prev-<time>`; `--rollback` swaps the most recent one back. Changes no unit or setting; the new Mutter loads at the next login |
+| `remote-settings.py` (menu entry "UST", command `ust`) | Runs as the desktop user, never with sudo: dashboard and `--status`, `--scale`, `--multi-monitor`; `--install-shortcut` adds the launcher to an existing installation and renames the entries an earlier setup wrote |
+| `disable-native.py`, `disable-login.py` | Explicit rollback entry points that stop or switch the related RDP backends; read the specific script and the install record first |
+| `reload-native-idle.py` | Waits for the backend to be idle and then reloads RDP; cannot update a running Mutter |
+| `tests/live_power_save.py` | Live-hardware test requiring explicit confirmation that changes display power and lease state; not part of default CI |
 
-日期化 `/opt` 前缀与维护脚本中的旧清单锚点属于特定升级协议。只改路径而不重新编译资源前缀会导致 GDM 无法读取资源。`--headless` GRD 在这里选择独立设置/凭据，并不表示它创建了第二个用户桌面。
+The dated `/opt` prefix and the old-manifest anchors in the maintenance scripts belong to specific upgrade protocols. Changing only the path without recompiling the resource prefix leaves GDM unable to read its resources. `--headless` GRD is used here to select separate settings/credentials; it does not mean a second user desktop is created.
 
-## 保留当前工作
+## Preserving current work
 
-正在运行的 Wayland compositor 不能在保留其所有客户端的前提下直接替换。准备或原子发布下一次启动的文件，与重启/注销是两个阶段；必须由用户保存工作后正常重新登录或重启加载。
+A running Wayland compositor cannot be replaced directly while keeping all of its clients. Preparing or atomically publishing the files for the next start is a separate phase from restarting/logging out; the user must save their work and then log in again normally or reboot to load them.
 
-原生后端默认不停止旧共享桌面的服务。只有明确选择 `--retire-legacy-services` 时才执行相关迁移动作。
+By default the native backend does not stop the services of the old shared desktop. The related migration actions run only when `--retire-legacy-services` is explicitly chosen.
 
-系统 ABI 指纹变化用于诊断，私有启动还必须通过精确兼容配置和目标测试收据检查。
-未验证组合只有在确认无隐私 guard、无现存 compositor 时才回退系统 Shell，原生后端
-在该会话中退出；有 guard 或状态不明时拒绝启动。打包后的最终产物需重新验证，
-installer 会阻止激活缺少有效收据的新启动器。详见 [兼容机制](COMPATIBILITY.md)。
+A change in the system ABI fingerprint is used for diagnostics; a private start must also pass the exact compatibility profile and target test receipt checks.
+An unverified combination falls back to the system Shell only when it is confirmed that there is no privacy guard and no existing compositor, and the native backend
+exits for that session; if a guard exists or the state is unclear, startup is refused. The final packaged artifact must be re-verified, and the
+installer refuses to activate a new launcher that lacks a valid receipt. See [Compatibility mechanism](COMPATIBILITY.md).
 
-私有模式会拒绝清理本项目路径后仍存在的 `LD_PRELOAD` 或 `LD_AUDIT`，避免预加载库抢先
-占用 Mutter 的同名库。启动器保留发行版原始 `ExecStart` 和 wrapper 参数，但不能阻止
-任意 wrapper 在执行后重新设置加载环境。额外 wrapper（包括会注入库的远程桌面产品）
-必须在目标环境按实际命令与环境完成验证；当前默认 CI 不证明这些 wrapper 可用。
-不要通过 wrapper 重新注入变量来绕过启动检查。有隐私 guard 的启动尤其不能依赖未经验证的 wrapper。
+Private mode refuses any `LD_PRELOAD` or `LD_AUDIT` that is still present after this project's paths are cleaned up, so that preloaded libraries cannot take the same-named
+libraries ahead of Mutter. The launcher keeps the distribution's original `ExecStart` and wrapper arguments, but it cannot stop
+an arbitrary wrapper from setting loader environment again after it executes. Additional wrappers (including remote-desktop products that inject libraries)
+must be verified in the target environment against the actual command and environment; the current default CI does not prove that these wrappers work.
+Do not re-inject variables through a wrapper to bypass the startup check. A start with a privacy guard in particular must not depend on an unverified wrapper.
 
-## 实机验收
+## Live acceptance
 
-保存工作并重启后，先停留在 GDM，不要本地登录；从实际客户端连接 3392，在远程 Ubuntu 登录画面验证账号，确认桌面显示与输入。记录是否自动重定向或需要手动重连。
+After saving work and rebooting, stay at GDM first and do not log in locally; connect to 3392 from the actual client, verify the account on the remote Ubuntu login screen, and confirm desktop display and input. Record whether the redirect is automatic or a manual reconnect is needed.
 
-随后检查断开重连保留同一应用、本地密码接回撤销远程，以及保存工作后注销再登录。锁确认失败后的本地恢复界面可用，只证明恢复路径工作，不代表远程登录验收通过。
+Then check that disconnect/reconnect keeps the same applications, that local password reclaim revokes the remote, and that logging out and back in after saving work works. A usable local recovery screen after lock confirmation fails only proves the recovery path works; it does not mean remote login acceptance has passed.
 
-只读状态检查：
+Read-only status checks:
 
 ```bash
 gdbus call --session --dest org.gnome.Mutter.NativeTakeover \
@@ -55,4 +57,4 @@ journalctl --user -b -u ubuntu-native-takeover.service \
   -u ubuntu-native-login-guard.service
 ```
 
-排查时保留失败启动的日志；仅凭 3392 监听、TLS 握手或新一次本地登录后的正常状态，不能判定此前的开机交接已修复。
+When troubleshooting, keep the logs of the failed start; a listening 3392, a TLS handshake, or a normal state after a new local login cannot by themselves show that the earlier boot handover has been fixed.
